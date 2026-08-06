@@ -1,0 +1,41 @@
+# Wayline — LOCAL DEV stack.
+# Session 0 scope: just Postgres. You run the app on the host with `npm run dev`
+# for hot reload; this only needs to bring up the database.
+#
+# The full production stack (wayline-app built image + cloudflared tunnel, with
+# Postgres NOT published to the host) is built in Session 7 — see WAYLINE_BUILD.md §7/§8.
+#
+# Postgres is bound to 127.0.0.1 only, so it's reachable from host tooling
+# (Prisma, `npm run dev`) but never from the network.
+#
+# Host port is 5433 (not 5432) to avoid clashing with another local Postgres on
+# this dev machine. DATABASE_URL in .env points at 5433 to match. Container-internal
+# port stays 5432.
+
+name: wayline
+
+services:
+  wayline-db:
+    image: postgres:16
+    container_name: wayline-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-wayline}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-wayline_dev_pw}
+      POSTGRES_DB: ${POSTGRES_DB:-wayline}
+    ports:
+      - "127.0.0.1:5433:5432"
+    volumes:
+      - wayline-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U ${POSTGRES_USER:-wayline} -d ${POSTGRES_DB:-wayline}",
+        ]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+volumes:
+  wayline-db-data:

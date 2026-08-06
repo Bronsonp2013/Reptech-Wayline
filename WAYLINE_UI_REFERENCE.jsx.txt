@@ -1,0 +1,1473 @@
+/* ============================================================
+   WAYLINE — UI REFERENCE (prototype artifact)
+
+   WHAT THIS IS
+   A single-file React prototype of Wayline built and iterated in the
+   Claude artifact environment. It is the living reference for the LOOK and
+   INTERACTION MODEL — pair it with WAYLINE_DESIGN.md when building the real
+   UI (Build Sessions 3 and 4).
+
+   HOW CLAUDE CODE SHOULD USE IT
+   - Treat this as design/interaction truth, NOT as production architecture.
+   - Match its visuals, component shapes, copy, and gesture model.
+   - Do NOT copy its data layer: it uses in-browser state + the artifact's
+     window.storage. The real app replaces that with the Next.js API +
+     PostgreSQL described in WAYLINE_BUILD.md, behind the same boundaries.
+   - The geocode() and store module here are deliberate SWAP BOUNDARIES;
+     in production they become the server geocoding queue and the database.
+
+   WHAT IT DEMONSTRATES (all working in the prototype)
+   - List + map as peers, shared filter/selection state, responsive layout
+   - Cadence status coloring (overdue/due/soon/current)
+   - Account detail sheet: log contact, edit cadence, delete
+   - Manual add with GPS capture; CSV import with confidence flags
+   - Freehand lasso (pointer capture, point-in-polygon), filter-aware
+   - Google Maps multi-stop + Waze single-destination export
+   - "Needs location" list; persistence via window.storage
+
+   NOT INCLUDED HERE (built fresh in the real app)
+   - Auth / multi-tenant scoping (see WAYLINE_SECURITY.md)
+   - Real database + server API (see WAYLINE_BUILD.md)
+   - Background geocoding queue (prototype geocodes inline/throttled)
+   ============================================================ */
+
+import React, { useState, useMemo, useEffect, useRef, useCallback } from "react";
+
+/* ----------------------------- PERSISTENCE -----------------------------
+   One module everything persists through. Today it wraps the artifact's
+   window.storage key-value API; later this swaps for a real backend with
+   no change to feature code. All calls are async and failure-tolerant —
+   a storage error never crashes the app or drops in-memory state. */
+const STORE_KEY = "wayline:accounts:v1";
+const store = {
+  available() { return typeof window !== "undefined" && !!window.storage; },
+  async loadAccounts() {
+    if (!this.available()) return null;
+    try {
+      const r = await window.storage.get(STORE_KEY);
+      if (r && r.value) return JSON.parse(r.value);
+      return null; // nothing stored yet → first-ever run
+    } catch (e) { return null; }
+  },
+  async saveAccounts(accounts) {
+    if (!this.available()) return false;
+    try {
+      await window.storage.set(STORE_KEY, JSON.stringify(accounts));
+      return true;
+    } catch (e) { return false; }
+  },
+  async clear() {
+    if (!this.available()) return false;
+    try { await window.storage.delete(STORE_KEY); return true; }
+    catch (e) { return false; }
+  },
+};
+
+/* ============================================================
+   WAYLINE — Territory map + lasso routing (focused build).
+
+   This artifact isolates the hard foundation:
+   - geocode boundary: coords-from-import → Nominatim → needsLocation
+   - CSV import with lat/lng detection + throttled Nominatim fallback
+   - real-coordinate pins, low-confidence ones visually distinct
+   - freehand lasso (button-toggled) + point-in-polygon selection
+   - filter narrows what the lasso catches; lasso itself grabs all
+   - "needs location" list for selected accounts with no usable pin
+   - export: Google Maps multi-stop, Waze single-destination
+
+   Trip builder, cadence editing, and clusters are intentionally
+   left out — they get rebuilt on top of this once it's verified.
+   The data model still carries cadence so pins color by status.
+   ============================================================ */
+
+/* ----------------------------- THEME ----------------------------- */
+const T = {
+  bg: "#1c1410", bg2: "#241a14", card: "#2c211a", cardHi: "#352820",
+  ink: "#f3e9df", inkDim: "#b09a87", inkFaint: "#7c6a5b",
+  brass: "#c79a5b", brassHi: "#e8c98a", line: "#3d2f25",
+  rust: "#c5613f", amber: "#d9a23f", sage: "#7fa06a",
+};
+
+const STATUS = {
+  overdue: { label: "Overdue", color: T.rust },
+  due:     { label: "Due now", color: T.amber },
+  soon:    { label: "Due soon", color: T.amber },
+  ok:      { label: "Current", color: T.sage },
+};
+
+/* confidence of a pin's location */
+const CONF = {
+  exact:  { label: "Exact", note: "from import" },
+  approx: { label: "Approx", note: "geocoded" },
+  none:   { label: "No location", note: "needs an address" },
+};
+
+/* ----------------------------- DATE / STATUS ----------------------------- */
+const DAY = 86400000;
+const now = () => Date.now();
+const addDays = (ts, d) => ts + d * DAY;
+const daysBetween = (a, b) => Math.round((b - a) / DAY);
+function deriveStatus(a) {
+  const last = a.lastContact || 0;
+  const r = daysBetween(now(), addDays(last, a.cadenceDays));
+  if (r < 0) return "overdue";
+  if (r <= 14) return "due";
+  if (r <= 30) return "soon";
+  return "ok";
+}
+function lastContactLabel(ts) {
+  if (!ts) return "never contacted";
+  const d = daysBetween(ts, now());
+  if (d <= 0) return "contacted today";
+  if (d === 1) return "1 day ago";
+  if (d < 30) return `${d} days ago`;
+  if (d < 365) return `${Math.round(d / 30)} mo ago`;
+  return `${(d / 365).toFixed(1)} yr ago`;
+}
+
+/* ----------------------------- GEOCODE BOUNDARY -----------------------------
+   One function decides where an account sits. Today it routes:
+     1. coordinates already present (from CSV/Takeout) → confidence "exact"
+     2. has an address string → Nominatim lookup → confidence "approx"
+     3. neither → confidence "none" (surfaces in the needs-location list)
+   Later, a Google-via-backend route slots in between 1 and 2 with no
+   change to anything that consumes lat/lng. */
+async function geocodeOne(acct) {
+  if (typeof acct.lat === "number" && !isNaN(acct.lat) && typeof acct.lng === "number" && !isNaN(acct.lng)) {
+    return { lat: acct.lat, lng: acct.lng, confidence: "exact", source: acct.source || "import" };
+  }
+  if (!acct.address) return { lat: null, lng: null, confidence: "none", source: "none" };
+  const q = [acct.address, acct.city, "TX"].filter(Boolean).join(", ");
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?format=json&limit=1&countrycodes=us&q=${encodeURIComponent(q)}`;
+    const res = await fetch(url, { headers: { "Accept": "application/json" } });
+    if (!res.ok) return { lat: null, lng: null, confidence: "none", source: "none" }; // 429/5xx → clean miss
+    const data = await res.json();
+    if (Array.isArray(data) && data.length) {
+      const lat = parseFloat(data[0].lat);
+      const lng = parseFloat(data[0].lon);
+      if (!isNaN(lat) && !isNaN(lng)) {
+        return { lat, lng, confidence: "approx", source: "nominatim" };
+      }
+    }
+  } catch (e) { /* network/parse failure → treated as a miss below */ }
+  return { lat: null, lng: null, confidence: "none", source: "none" };
+}
+
+/* Throttle to respect Nominatim's ~1 req/sec courtesy limit. Rows that
+   already have coords resolve instantly and don't count against the clock. */
+async function geocodeBatch(accts, onProgress) {
+  const out = [];
+  let i = 0;
+  for (const a of accts) {
+    const hadCoords = typeof a.lat === "number" && typeof a.lng === "number";
+    const r = await geocodeOne(a);
+    out.push({ ...a, ...r });
+    i++;
+    if (onProgress) onProgress(i, accts.length);
+    if (!hadCoords && a.address) await new Promise((res) => setTimeout(res, 1100));
+  }
+  return out;
+}
+
+/* ----------------------------- POINT IN POLYGON -----------------------------
+   Ray-casting test. polygon is [[lat,lng],...]; point is [lat,lng].
+   Works in screen space too — we feed it pixel coords from the lasso. */
+function pointInPolygon(point, polygon) {
+  const [x, y] = point;
+  let inside = false;
+  for (let i = 0, j = polygon.length - 1; i < polygon.length; j = i++) {
+    const [xi, yi] = polygon[i];
+    const [xj, yj] = polygon[j];
+    const intersect =
+      (yi > y) !== (yj > y) &&
+      x < ((xj - xi) * (y - yi)) / (yj - yi) + xi;
+    if (intersect) inside = !inside;
+  }
+  return inside;
+}
+
+/* ----------------------------- EXPORT URLS -----------------------------
+   Google Maps takes an ordered multi-stop route (origin + waypoints + dest).
+   Waze has no multi-stop URL scheme, so it gets a single destination. */
+const GMAPS_MAX = 10;
+function googleMapsUrl(stops) {
+  const pts = stops.filter((s) => s.lat != null && s.lng != null).slice(0, GMAPS_MAX);
+  if (!pts.length) return null;
+  const coords = pts.map((s) => `${s.lat},${s.lng}`);
+  return `https://www.google.com/maps/dir/?api=1&travelmode=driving` +
+    `&origin=${coords[0]}` +
+    `&destination=${coords[coords.length - 1]}` +
+    (coords.length > 2 ? `&waypoints=${coords.slice(1, -1).join("|")}` : "");
+}
+function wazeUrl(stop) {
+  if (!stop || stop.lat == null) return null;
+  return `https://waze.com/ul?ll=${stop.lat},${stop.lng}&navigate=yes`;
+}
+
+/* ----------------------------- SEED DATA -----------------------------
+   Mix of accounts WITH real coordinates (exact) and a couple address-only
+   or location-less ones, so every path is exercisable without a Takeout file. */
+let _id = 0;
+const mk = (name, city, lat, lng, cadenceDays, lastDaysAgo, opts = {}) => ({
+  id: ++_id, name, city,
+  lat: lat, lng: lng,
+  address: opts.address || "",
+  source: lat != null ? "import" : "",
+  cadenceDays,
+  lastContact: lastDaysAgo == null ? null : addDays(now(), -lastDaysAgo),
+  confidence: lat != null ? "exact" : null,
+});
+
+const SEED = [
+  // Austin metro — real-ish coordinates
+  mk("Tailored Living", "Austin", 30.2849, -97.7341, 180, 200),
+  mk("Hill Country Interiors", "Austin", 30.2515, -97.7683, 90, 95),
+  mk("Westlake Design Co", "Austin", 30.2672, -97.8050, 365, 40),
+  mk("Lakeway Furnishings", "Austin", 30.3637, -97.9794, 180, 175),
+  mk("Mueller Home", "Austin", 30.2980, -97.7060, 90, 30),
+  // San Marcos / Boerne / San Antonio — spread for lasso testing
+  mk("River District Design", "San Marcos", 29.8833, -97.9414, 90, 50),
+  mk("Cibolo Creek Interiors", "Boerne", 29.7947, -98.7320, 180, 170),
+  mk("Alamo Furnishings", "San Antonio", 29.4241, -98.4936, 90, 88),
+  mk("Pearl District Design", "San Antonio", 29.4430, -98.4800, 180, 30),
+  // Houston cluster
+  mk("Bayou Home", "Houston", 29.7604, -95.3698, 180, 210),
+  mk("Heights Furniture", "Houston", 29.7989, -95.3980, 90, 30),
+  mk("Galleria Showroom", "Houston", 29.7400, -95.4640, 180, 175),
+  // Dallas / Fort Worth
+  mk("Knox District Home", "Dallas", 32.8200, -96.7900, 90, 100),
+  mk("Preston Hollow Design", "Dallas", 32.8870, -96.8060, 180, 60),
+  mk("Stockyards Home", "Fort Worth", 32.7889, -97.3470, 180, 185),
+  // Address-only (will geocode via Nominatim on import-style refresh)
+  mk("New Vista Home", "Austin", null, null, 90, 220, { address: "1100 S Congress Ave" }),
+  // No location at all (lands in needs-location list)
+  mk("Permian Home", "Odessa", null, null, 365, 410),
+];
+
+/* ----------------------------- SMALL UI ----------------------------- */
+function Dot({ color, size = 10, hollow = false }) {
+  return (
+    <span style={{
+      display: "inline-block", width: size, height: size, borderRadius: "50%",
+      background: hollow ? "transparent" : color,
+      border: hollow ? `2px solid ${color}` : "none",
+      boxShadow: hollow ? "none" : `0 0 8px ${color}88`,
+    }} />
+  );
+}
+
+/* ----------------------------- MAP + LASSO ----------------------------- */
+function TerritoryMap({ accounts, selectedIds, onSelect, onOpenDetail, drawMode, setDrawMode }) {
+  const elRef = useRef(null);
+  const mapRef = useRef(null);
+  const layerRef = useRef(null);
+  const overlayRef = useRef(null); // SVG path for the lasso stroke
+  const [ready, setReady] = useState(false);
+  const [failed, setFailed] = useState(false);
+  const ptsRef = useRef([]); // lasso points in screen (container) space
+  const drawingRef = useRef(false);
+
+  // mappable accounts only
+  const located = useMemo(() => accounts.filter((a) => a.lat != null && a.lng != null), [accounts]);
+
+  // load Leaflet
+  useEffect(() => {
+    let cancelled = false;
+    if (window.L) { setReady(true); return; }
+    const css = document.createElement("link");
+    css.rel = "stylesheet"; css.href = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.css";
+    document.head.appendChild(css);
+    const js = document.createElement("script");
+    js.src = "https://unpkg.com/leaflet@1.9.4/dist/leaflet.js";
+    js.onload = () => { if (!cancelled) setReady(true); };
+    js.onerror = () => { if (!cancelled) setFailed(true); };
+    document.body.appendChild(js);
+    return () => { cancelled = true; };
+  }, []);
+
+  // build map
+  useEffect(() => {
+    if (!ready || !elRef.current || mapRef.current) return;
+    const L = window.L;
+    const map = L.map(elRef.current, { zoomControl: true, attributionControl: false })
+      .setView([31.1, -98.5], 6);
+    L.tileLayer("https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png", { maxZoom: 19 }).addTo(map);
+    mapRef.current = map;
+    layerRef.current = L.layerGroup().addTo(map);
+    setTimeout(() => map.invalidateSize(), 80);
+  }, [ready]);
+
+  // draw markers
+  useEffect(() => {
+    if (!ready || !mapRef.current) return;
+    const L = window.L;
+    const lg = layerRef.current;
+    lg.clearLayers();
+    const pts = [];
+    located.forEach((a) => {
+      const ll = [a.lat, a.lng];
+      pts.push(ll);
+      const color = STATUS[deriveStatus(a)].color;
+      const sel = selectedIds.has(a.id);
+      const approx = a.confidence === "approx";
+      const html = `<div style="transform:translate(-8px,-8px);display:flex;align-items:center;gap:5px">
+        <span style="width:16px;height:16px;border-radius:50%;
+          background:${approx ? "transparent" : color};
+          border:${sel ? `3px solid ${T.brassHi}` : approx ? `2px dashed ${color}` : "2px solid #1c1410"};
+          box-shadow:${sel ? `0 0 14px ${T.brass}` : `0 0 8px ${color}99`}"></span>
+        <span style="font-size:11px;font-weight:600;color:${sel ? T.brassHi : "#f3e9df"};
+          white-space:nowrap;text-shadow:0 1px 3px #000">${a.name}</span></div>`;
+      L.marker(ll, { icon: L.divIcon({ className: "", html, iconSize: [0, 0] }) })
+        .addTo(lg)
+        .on("click", () => { if (!drawMode && onOpenDetail) onOpenDetail(a.id); });
+    });
+    if (pts.length && !mapRef.current._fitted) {
+      mapRef.current.fitBounds(pts, { padding: [50, 50] });
+      mapRef.current._fitted = true;
+    }
+  }, [ready, located, selectedIds, drawMode, onOpenDetail]);
+
+  // toggle map dragging when entering/leaving draw mode
+  useEffect(() => {
+    if (!mapRef.current) return;
+    const map = mapRef.current;
+    if (drawMode) { map.dragging.disable(); map.doubleClickZoom.disable(); }
+    else { map.dragging.enable(); map.doubleClickZoom.enable(); }
+  }, [drawMode]);
+
+  // lasso drawing via pointer events on an overlay
+  const finishLasso = useCallback(() => {
+    const map = mapRef.current;
+    const pts = ptsRef.current;
+    if (!map || pts.length < 3) { ptsRef.current = []; redraw(); return; }
+    // convert each located account's latlng to container point, test inside
+    const hits = [];
+    located.forEach((a) => {
+      const cp = map.latLngToContainerPoint([a.lat, a.lng]);
+      if (pointInPolygon([cp.x, cp.y], pts)) hits.push(a.id);
+    });
+    onSelect(hits, "replace");
+    ptsRef.current = [];
+    redraw();
+    setDrawMode(false);
+  }, [located, onSelect, setDrawMode]);
+
+  const redraw = useCallback(() => {
+    const svg = overlayRef.current;
+    if (!svg) return;
+    const pts = ptsRef.current;
+    const d = pts.length ? "M" + pts.map((p) => `${p[0]},${p[1]}`).join("L") + (drawingRef.current ? "" : "Z") : "";
+    svg.querySelector("path").setAttribute("d", d);
+  }, []);
+
+  const onDown = (e) => {
+    if (!drawMode) return;
+    try { e.currentTarget.setPointerCapture(e.pointerId); } catch (_) {}
+    drawingRef.current = true;
+    ptsRef.current = [[e.nativeEvent.offsetX, e.nativeEvent.offsetY]];
+    redraw();
+  };
+  const onMove = (e) => {
+    if (!drawMode || !drawingRef.current) return;
+    ptsRef.current.push([e.nativeEvent.offsetX, e.nativeEvent.offsetY]);
+    redraw();
+  };
+  const onUp = (e) => {
+    if (!drawMode || !drawingRef.current) return;
+    try { if (e && e.pointerId != null) e.currentTarget.releasePointerCapture(e.pointerId); } catch (_) {}
+    drawingRef.current = false;
+    finishLasso();
+  };
+
+  if (failed) {
+    return (
+      <div style={{
+        height: 440, borderRadius: 16, border: `1px solid ${T.line}`, background: T.bg2,
+        display: "flex", alignItems: "center", justifyContent: "center", textAlign: "center", padding: 24,
+      }}>
+        <div>
+          <div style={{ fontWeight: 700, color: T.ink, marginBottom: 6 }}>Map couldn't load</div>
+          <div style={{ color: T.inkDim, fontSize: 13.5, maxWidth: 320 }}>
+            No connection to the map tiles. Accounts are still listed below and exports still work.
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ position: "relative" }}>
+      <div ref={elRef} style={{ height: 440, borderRadius: 16, overflow: "hidden", border: `1px solid ${T.line}`, background: T.bg2 }} />
+
+      {/* lasso overlay — only intercepts pointer events while drawing */}
+      <div
+        onPointerDown={onDown}
+        onPointerMove={onMove}
+        onPointerUp={onUp}
+        onPointerLeave={onUp}
+        style={{
+          position: "absolute", inset: 0, borderRadius: 16,
+          pointerEvents: drawMode ? "auto" : "none",
+          cursor: drawMode ? "crosshair" : "default",
+          touchAction: drawMode ? "none" : "auto",
+        }}
+      >
+        <svg ref={overlayRef} width="100%" height="100%" style={{ position: "absolute", inset: 0 }}>
+          <path d="" fill={`${T.brass}22`} stroke={T.brassHi} strokeWidth="2" strokeDasharray="4 4" />
+        </svg>
+      </div>
+
+      {/* draw control */}
+      <div style={{ position: "absolute", top: 12, right: 12, display: "flex", gap: 8, zIndex: 500 }}>
+        <button
+          onClick={() => setDrawMode(!drawMode)}
+          style={{
+            cursor: "pointer", border: "none", borderRadius: 10, padding: "9px 14px",
+            fontWeight: 800, fontSize: 13, letterSpacing: 0.2,
+            background: drawMode ? T.brassHi : `${T.bg2}ee`,
+            color: drawMode ? "#241a10" : T.brass,
+            border: `1px solid ${drawMode ? T.brassHi : T.line}`,
+            boxShadow: "0 4px 14px rgba(0,0,0,.4)",
+          }}
+        >
+          {drawMode ? "Drawing… tap to cancel" : "✏ Draw area"}
+        </button>
+      </div>
+
+      {drawMode && (
+        <div style={{
+          position: "absolute", bottom: 12, left: "50%", transform: "translateX(-50%)",
+          background: `${T.bg2}f0`, border: `1px solid ${T.brass}55`, color: T.brassHi,
+          fontSize: 12.5, fontWeight: 600, padding: "8px 14px", borderRadius: 999, zIndex: 500,
+          whiteSpace: "nowrap", boxShadow: "0 4px 14px rgba(0,0,0,.4)",
+        }}>
+          Draw a loop around the accounts you want
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------- SELECTION PANEL ----------------------------- */
+function SelectionPanel({ accounts, selectedIds, onClear, onToggle, onExportGoogle, onExportWaze }) {
+  const selected = accounts.filter((a) => selectedIds.has(a.id));
+  const located = selected.filter((a) => a.lat != null && a.lng != null);
+  const needLoc = selected.filter((a) => a.lat == null || a.lng == null);
+
+  if (!selected.length) {
+    return (
+      <div style={{
+        background: T.card, border: `1px dashed ${T.line}`, borderRadius: 16,
+        padding: "28px 22px", textAlign: "center",
+      }}>
+        <div style={{ fontWeight: 700, color: T.ink, marginBottom: 6 }}>No area selected</div>
+        <div style={{ color: T.inkDim, fontSize: 13.5, lineHeight: 1.55, maxWidth: 360, margin: "0 auto" }}>
+          Tap <b style={{ color: T.brass }}>Draw area</b> on the map and loop around a city or a stretch of road.
+          Everything inside lands here, ready to send to Google Maps or Waze.
+        </div>
+      </div>
+    );
+  }
+
+  const gUrl = googleMapsUrl(located);
+  const overCap = located.length > GMAPS_MAX;
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ fontSize: 18, fontWeight: 800, color: T.ink }}>
+          {selected.length} selected
+        </div>
+        <div style={{ fontSize: 12.5, color: T.inkFaint }}>{located.length} mappable</div>
+        <button
+          onClick={onClear}
+          style={{
+            marginLeft: "auto", cursor: "pointer", border: `1px solid ${T.line}`,
+            background: "transparent", color: T.inkFaint, fontWeight: 600, fontSize: 12.5,
+            borderRadius: 9, padding: "7px 12px",
+          }}
+        >
+          Clear
+        </button>
+      </div>
+
+      {/* export actions */}
+      <div style={{ display: "flex", gap: 8 }}>
+        <a
+          href={gUrl || undefined}
+          target="_blank" rel="noreferrer"
+          onClick={(e) => { if (!gUrl) e.preventDefault(); }}
+          style={{
+            flex: 1, textAlign: "center", textDecoration: "none",
+            cursor: gUrl ? "pointer" : "not-allowed", borderRadius: 11,
+            background: gUrl ? `linear-gradient(135deg, ${T.brass}, ${T.brassHi})` : T.cardHi,
+            color: gUrl ? "#241a10" : T.inkFaint, fontWeight: 800, fontSize: 14, padding: "13px 0",
+          }}
+        >
+          Open in Google Maps
+        </a>
+      </div>
+      {overCap && (
+        <div style={{ fontSize: 12, color: T.amber, marginTop: -6 }}>
+          Google Maps takes up to {GMAPS_MAX} stops — the first {GMAPS_MAX} go; trim the rest or split the day.
+        </div>
+      )}
+
+      {/* the selected list, each with a single-stop Waze link */}
+      <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, overflow: "hidden" }}>
+        {located.map((a, i) => {
+          const s = deriveStatus(a);
+          return (
+            <div key={a.id} style={{
+              display: "flex", alignItems: "center", gap: 11, padding: "11px 14px",
+              borderTop: i ? `1px solid ${T.line}` : "none",
+            }}>
+              <Dot color={STATUS[s].color} size={9} hollow={a.confidence === "approx"} />
+              <div style={{ flex: 1, minWidth: 0 }}>
+                <div style={{ fontSize: 14, fontWeight: 600, color: T.ink }}>{a.name}</div>
+                <div style={{ fontSize: 11.5, color: T.inkFaint }}>
+                  {a.city} · {STATUS[s].label}{a.confidence === "approx" ? " · approx pin" : ""}
+                </div>
+              </div>
+              <a
+                href={wazeUrl(a)} target="_blank" rel="noreferrer"
+                style={{
+                  textDecoration: "none", cursor: "pointer", borderRadius: 8,
+                  border: `1px solid ${T.line}`, color: T.brass, fontWeight: 700, fontSize: 12,
+                  padding: "6px 10px",
+                }}
+              >
+                Waze
+              </a>
+              <button
+                onClick={() => onToggle(a.id)}
+                aria-label="Remove"
+                style={{
+                  cursor: "pointer", border: `1px solid ${T.line}`, borderRadius: 8,
+                  background: "transparent", color: T.inkFaint, fontWeight: 700, fontSize: 14,
+                  padding: "6px 10px", lineHeight: 1,
+                }}
+              >
+                ×
+              </button>
+            </div>
+          );
+        })}
+      </div>
+
+      {/* needs-location list — selected but unmappable */}
+      {needLoc.length > 0 && (
+        <div style={{ background: `${T.rust}10`, border: `1px solid ${T.rust}33`, borderRadius: 12, padding: "12px 14px" }}>
+          <div style={{ fontSize: 12, fontWeight: 700, color: T.rust, marginBottom: 8, letterSpacing: 0.3 }}>
+            NEEDS A LOCATION ({needLoc.length})
+          </div>
+          <div style={{ fontSize: 12.5, color: T.inkDim, marginBottom: 10, lineHeight: 1.5 }}>
+            These were in your loop but have no usable pin yet. Add an address on import to map them.
+          </div>
+          <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+            {needLoc.map((a) => (
+              <span key={a.id} style={{
+                fontSize: 12, color: T.ink, background: T.bg2, border: `1px solid ${T.line}`,
+                borderRadius: 999, padding: "5px 10px",
+              }}>
+                {a.name} · {a.city}
+              </span>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------- IMPORT ----------------------------- */
+function parseCSV(text) {
+  const lines = text.trim().split(/\r?\n/).filter((l) => l.trim());
+  if (!lines.length) return { rows: [], error: "The file is empty." };
+  const split = (line) => {
+    const out = []; let cur = ""; let q = false;
+    for (let i = 0; i < line.length; i++) {
+      const ch = line[i];
+      if (ch === '"') q = !q;
+      else if (ch === "," && !q) { out.push(cur); cur = ""; }
+      else cur += ch;
+    }
+    out.push(cur);
+    return out.map((s) => s.trim().replace(/^"|"$/g, ""));
+  };
+  const header = split(lines[0]).map((h) => h.toLowerCase());
+  const find = (...keys) => header.findIndex((h) => keys.some((k) => h.includes(k)));
+  const iName = find("name", "title");
+  const iCity = find("city", "town");
+  if (iName < 0) return { rows: [], error: "Couldn't find a name column. A “name” header is required." };
+  const iLat = find("lat");
+  const iLng = find("lng", "lon", "long");
+  const iAddr = find("address", "street", "addr");
+  const iCad = find("cadence");
+  const rows = [];
+  for (let r = 1; r < lines.length; r++) {
+    const c = split(lines[r]);
+    const name = c[iName];
+    if (!name) continue;
+    let lat = null, lng = null;
+    if (iLat >= 0 && iLng >= 0) {
+      const la = parseFloat(c[iLat]); const lo = parseFloat(c[iLng]);
+      if (!isNaN(la) && !isNaN(lo)) { lat = la; lng = lo; }
+    }
+    let cad = 180;
+    if (iCad >= 0) { const n = parseInt(c[iCad], 10); if (!isNaN(n) && n > 0) cad = n; }
+    rows.push({
+      name, city: iCity >= 0 ? c[iCity] || "Unsorted" : "Unsorted",
+      lat, lng, address: iAddr >= 0 ? c[iAddr] || "" : "",
+      cadenceDays: cad,
+    });
+  }
+  if (!rows.length) return { rows: [], error: "No data rows found under the header." };
+  return { rows, error: null };
+}
+
+function ImportView({ onImport }) {
+  const [text, setText] = useState("");
+  const [preview, setPreview] = useState(null);
+  const [err, setErr] = useState(null);
+  const [busy, setBusy] = useState(false);
+  const [prog, setProg] = useState(null);
+  const fileRef = useRef(null);
+
+  const run = (raw) => {
+    const { rows, error } = parseCSV(raw);
+    setErr(error); setPreview(error ? null : rows);
+  };
+  const onFile = (e) => {
+    const f = e.target.files?.[0]; if (!f) return;
+    const reader = new FileReader();
+    reader.onload = () => { const t = String(reader.result); setText(t); run(t); };
+    reader.readAsText(f);
+  };
+
+  const doImport = async () => {
+    if (!preview) return;
+    setBusy(true);
+    const seeded = preview.map((r) => ({ ...r, id: ++_id, lastContact: null, source: r.lat != null ? "import" : "" }));
+    const located = await geocodeBatch(seeded, (i, n) => setProg(`Locating ${i} of ${n}…`));
+    onImport(located);
+    setBusy(false); setProg(null); setText(""); setPreview(null); setErr(null);
+  };
+
+  const withCoords = "name,city,lat,lng,cadence\nQuarry Market Home,San Antonio,29.4670,-98.4900,90\nDomain Interiors,Austin,30.4010,-97.7250,180";
+  const withAddr = "name,city,address,cadence\nSouth Lamar Studio,Austin,1300 S Lamar Blvd,90\nBishop Arts Home,Dallas,408 N Bishop Ave,180";
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+      <p style={{ color: T.inkDim, fontSize: 13, margin: 0, lineHeight: 1.55 }}>
+        Paste or upload a CSV. A <b style={{ color: T.ink }}>name</b> is required; include{" "}
+        <b style={{ color: T.ink }}>lat</b> and <b style={{ color: T.ink }}>lng</b> for exact pins, or an{" "}
+        <b style={{ color: T.ink }}>address</b> and Wayline will locate it. Rows with neither still import —
+        they'll wait in the needs-location list.
+      </p>
+
+      <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+        <button onClick={() => fileRef.current?.click()} style={btn(T.cardHi, T.ink)}>Upload .csv</button>
+        <button onClick={() => { setText(withCoords); run(withCoords); }} style={btn("transparent", T.brass, true)}>Sample: coordinates</button>
+        <button onClick={() => { setText(withAddr); run(withAddr); }} style={btn("transparent", T.brass, true)}>Sample: addresses</button>
+        <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={onFile} style={{ display: "none" }} />
+      </div>
+
+      <textarea
+        value={text}
+        onChange={(e) => { setText(e.target.value); if (preview || err) run(e.target.value); }}
+        placeholder={"name,city,lat,lng,cadence\n…"}
+        spellCheck={false}
+        style={{
+          width: "100%", boxSizing: "border-box", minHeight: 120, resize: "vertical",
+          background: T.bg2, color: T.ink, border: `1px solid ${T.line}`, borderRadius: 12,
+          padding: 12, fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12.5, lineHeight: 1.5,
+        }}
+      />
+      <div>
+        <button onClick={() => run(text)} style={{ ...btn(`linear-gradient(135deg, ${T.brass}, ${T.brassHi})`, "#241a10"), fontWeight: 800, padding: "11px 20px" }}>
+          Preview
+        </button>
+      </div>
+
+      {err && (
+        <div style={{ fontSize: 13, color: T.rust, background: `${T.rust}14`, border: `1px solid ${T.rust}3a`, borderRadius: 10, padding: "10px 12px" }}>
+          {err}
+        </div>
+      )}
+
+      {preview && (
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 12, overflow: "hidden" }}>
+          <div style={{ padding: "10px 14px", borderBottom: `1px solid ${T.line}`, fontSize: 13, color: T.inkDim }}>
+            {preview.length} account{preview.length === 1 ? "" : "s"} · {preview.filter((r) => r.lat != null).length} with coordinates, {preview.filter((r) => r.lat == null && r.address).length} to geocode, {preview.filter((r) => r.lat == null && !r.address).length} without location
+          </div>
+          <div style={{ maxHeight: 200, overflow: "auto" }}>
+            {preview.map((r, i) => {
+              const kind = r.lat != null ? "exact" : r.address ? "approx" : "none";
+              const c = kind === "exact" ? T.sage : kind === "approx" ? T.amber : T.rust;
+              return (
+                <div key={i} style={{ display: "flex", alignItems: "center", gap: 10, padding: "9px 14px", borderTop: i ? `1px solid ${T.line}` : "none", fontSize: 13 }}>
+                  <Dot color={c} size={8} hollow={kind === "approx"} />
+                  <span style={{ flex: 1, color: T.ink, fontWeight: 600 }}>{r.name}</span>
+                  <span style={{ color: T.inkDim }}>{r.city}</span>
+                  <span style={{ color: T.inkFaint, fontSize: 11.5 }}>
+                    {kind === "exact" ? "exact" : kind === "approx" ? "will geocode" : "no location"}
+                  </span>
+                </div>
+              );
+            })}
+          </div>
+          <div style={{ padding: 12, borderTop: `1px solid ${T.line}` }}>
+            <button
+              onClick={doImport}
+              disabled={busy}
+              style={{
+                width: "100%", cursor: busy ? "wait" : "pointer", border: "none", borderRadius: 10,
+                background: busy ? T.cardHi : T.sage, color: busy ? T.inkDim : "#13200d",
+                fontWeight: 800, fontSize: 14, padding: "12px 0",
+              }}
+            >
+              {busy ? (prog || "Importing…") : `Import ${preview.length} account${preview.length === 1 ? "" : "s"}`}
+            </button>
+            {busy && (
+              <div style={{ fontSize: 11.5, color: T.inkFaint, textAlign: "center", marginTop: 8 }}>
+                Addresses are located one per second to respect the free geocoder's limit.
+              </div>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+function btn(bg, color, outline = false) {
+  return {
+    cursor: "pointer", border: `1px solid ${outline ? T.line : "transparent"}`,
+    background: bg, color, fontWeight: 700, fontSize: 13, borderRadius: 9, padding: "9px 14px",
+  };
+}
+
+/* ----------------------------- ADD ONE ACCOUNT -----------------------------
+   Quick roadside add. Save commits immediately — geocoding happens in the
+   background afterward, so a flaky connection never loses what Brian typed. */
+function AddAccountForm({ onSave, onCancel }) {
+  const [name, setName] = useState("");
+  const [city, setCity] = useState("");
+  const [address, setAddress] = useState("");
+  const [cadenceDays, setCadenceDays] = useState(180);
+  const [gps, setGps] = useState(null);          // {lat, lng} once captured
+  const [gpsState, setGpsState] = useState("idle"); // idle | locating | done | error
+  const [gpsErr, setGpsErr] = useState("");
+
+  const canSave = name.trim().length > 0;
+
+  const captureGps = () => {
+    if (!navigator.geolocation) { setGpsState("error"); setGpsErr("This device can't share a location."); return; }
+    setGpsState("locating"); setGpsErr("");
+    navigator.geolocation.getCurrentPosition(
+      (pos) => { setGps({ lat: pos.coords.latitude, lng: pos.coords.longitude }); setGpsState("done"); },
+      (err) => {
+        setGpsState("error");
+        setGpsErr(err.code === 1 ? "Location permission was denied." : "Couldn't get a location fix — try again or save with the address.");
+      },
+      { enableHighAccuracy: true, timeout: 10000, maximumAge: 0 }
+    );
+  };
+
+  const field = {
+    width: "100%", boxSizing: "border-box", background: T.bg2, color: T.ink,
+    border: `1px solid ${T.line}`, borderRadius: 10, padding: "11px 12px",
+    fontSize: 14, fontFamily: "inherit",
+  };
+  const lbl = { fontSize: 11, letterSpacing: 0.5, color: T.inkFaint, marginBottom: 5, display: "block" };
+
+  return (
+    <div style={{ background: T.card, border: `1px solid ${T.brass}44`, borderRadius: 14, padding: 16, display: "flex", flexDirection: "column", gap: 13 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <div style={{ fontSize: 15, fontWeight: 800, color: T.ink }}>New account</div>
+        <button onClick={onCancel} aria-label="Cancel" style={{
+          marginLeft: "auto", cursor: "pointer", border: `1px solid ${T.line}`, background: "transparent",
+          color: T.inkFaint, borderRadius: 8, fontSize: 15, fontWeight: 700, padding: "4px 10px", lineHeight: 1,
+        }}>×</button>
+      </div>
+
+      <div>
+        <label style={lbl}>NAME *</label>
+        <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Business name" style={field} autoFocus />
+      </div>
+      <div style={{ display: "flex", gap: 10 }}>
+        <div style={{ flex: 1 }}>
+          <label style={lbl}>CITY</label>
+          <input value={city} onChange={(e) => setCity(e.target.value)} placeholder="e.g. Austin" style={field} />
+        </div>
+      </div>
+      <div>
+        <label style={lbl}>ADDRESS</label>
+        <input value={address} onChange={(e) => setAddress(e.target.value)} placeholder="Street address (for the map pin)" style={field} />
+        <div style={{ fontSize: 11.5, color: T.inkFaint, marginTop: 5 }}>
+          Optional. If you add an address but no GPS, Wayline locates the pin in the background after saving.
+        </div>
+      </div>
+
+      {/* GPS capture — most accurate when Brian is standing at the account */}
+      <div>
+        <label style={lbl}>PIN LOCATION</label>
+        <button
+          onClick={captureGps}
+          disabled={gpsState === "locating"}
+          style={{
+            width: "100%", cursor: gpsState === "locating" ? "wait" : "pointer", borderRadius: 10, padding: "11px 0",
+            fontSize: 13.5, fontWeight: 700,
+            border: `1px solid ${gps ? T.sage : T.brass}66`,
+            background: gps ? `${T.sage}1e` : `${T.brass}14`,
+            color: gps ? T.sage : T.brass,
+            display: "flex", alignItems: "center", justifyContent: "center", gap: 8,
+          }}
+        >
+          {gpsState === "locating" ? "Getting your location…"
+            : gps ? "✓ Location captured — this sets the pin"
+            : "📍 Use my current location"}
+        </button>
+        {gps && (
+          <div style={{ display: "flex", alignItems: "center", gap: 8, marginTop: 6 }}>
+            <span style={{ fontSize: 11.5, color: T.inkFaint }}>
+              {gps.lat.toFixed(5)}, {gps.lng.toFixed(5)}
+            </span>
+            <button onClick={() => { setGps(null); setGpsState("idle"); }} style={{
+              cursor: "pointer", border: "none", background: "transparent", color: T.inkFaint,
+              fontSize: 11.5, textDecoration: "underline", padding: 0,
+            }}>
+              clear
+            </button>
+          </div>
+        )}
+        {gpsState === "error" && (
+          <div style={{ fontSize: 11.5, color: T.rust, marginTop: 6 }}>{gpsErr} You can still save with the address.</div>
+        )}
+        {!gps && gpsState !== "error" && (
+          <div style={{ fontSize: 11.5, color: T.inkFaint, marginTop: 6 }}>
+            Standing at the account? This drops an exact pin — no address needed.
+          </div>
+        )}
+      </div>
+
+      <div>
+        <label style={lbl}>CONTACT CADENCE</label>
+        <div style={{ display: "flex", gap: 8 }}>
+          {[90, 180, 365].map((d) => (
+            <button key={d} onClick={() => setCadenceDays(d)} style={{
+              flex: 1, cursor: "pointer", borderRadius: 10, padding: "10px 0", fontSize: 13.5, fontWeight: 700,
+              border: `1px solid ${cadenceDays === d ? T.brass : T.line}`,
+              background: cadenceDays === d ? `${T.brass}22` : "transparent",
+              color: cadenceDays === d ? T.brassHi : T.inkDim,
+            }}>
+              {d} days
+            </button>
+          ))}
+        </div>
+      </div>
+
+      <button
+        onClick={() => canSave && onSave({ name: name.trim(), city: city.trim() || "Unsorted", address: address.trim(), cadenceDays, gps })}
+        disabled={!canSave}
+        style={{
+          cursor: canSave ? "pointer" : "not-allowed", border: "none", borderRadius: 11,
+          background: canSave ? `linear-gradient(135deg, ${T.brass}, ${T.brassHi})` : T.cardHi,
+          color: canSave ? "#241a10" : T.inkFaint, fontWeight: 800, fontSize: 14.5, padding: "13px 0",
+        }}
+      >
+        Save account
+      </button>
+    </div>
+  );
+}
+
+/* ----------------------------- ACCOUNT LIST -----------------------------
+   The list is a peer to the map, not a sub-panel. Same filter, same
+   selection. Tapping a row toggles it into the selection (additive —
+   that's how you build a list), which lights the matching pin on the map. */
+function AccountList({ accounts, totalCount, selectedIds, onToggleRow, onOpenDetail, sort, setSort, onAddAccount }) {
+  const [adding, setAdding] = useState(false);
+  const sorted = useMemo(() => {
+    const arr = [...accounts];
+    const rank = { overdue: 0, due: 1, soon: 2, ok: 3 };
+    if (sort === "status") {
+      arr.sort((a, b) => rank[deriveStatus(a)] - rank[deriveStatus(b)]
+        || (a.lastContact || 0) - (b.lastContact || 0));
+    } else if (sort === "name") {
+      arr.sort((a, b) => a.name.localeCompare(b.name));
+    } else if (sort === "city") {
+      arr.sort((a, b) => a.city.localeCompare(b.city) || a.name.localeCompare(b.name));
+    } else if (sort === "recent") {
+      arr.sort((a, b) => (a.lastContact || 0) - (b.lastContact || 0)); // longest-ago first
+    }
+    return arr;
+  }, [accounts, sort]);
+
+  // when sorted by city, insert lightweight city headers
+  const withHeaders = useMemo(() => {
+    if (sort !== "city") return sorted.map((a) => ({ type: "row", a }));
+    const out = []; let cur = null;
+    sorted.forEach((a) => {
+      if (a.city !== cur) { cur = a.city; out.push({ type: "head", city: a.city }); }
+      out.push({ type: "row", a });
+    });
+    return out;
+  }, [sorted, sort]);
+
+  return (
+    <div style={{ display: "flex", flexDirection: "column", gap: 12 }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+        <div style={{ fontSize: 16, fontWeight: 800, color: T.ink }}>Accounts</div>
+        <button
+          onClick={() => setAdding((v) => !v)}
+          style={{
+            marginLeft: "auto", cursor: "pointer", border: "none", borderRadius: 10,
+            background: adding ? T.cardHi : `linear-gradient(135deg, ${T.brass}, ${T.brassHi})`,
+            color: adding ? T.inkDim : "#241a10", fontWeight: 800, fontSize: 13,
+            padding: "8px 14px",
+          }}
+        >
+          {adding ? "Close" : "+ Add account"}
+        </button>
+      </div>
+
+      {adding && (
+        <AddAccountForm
+          onCancel={() => setAdding(false)}
+          onSave={(data) => { onAddAccount(data); setAdding(false); }}
+        />
+      )}
+
+      <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+        <span style={{ fontSize: 11.5, color: T.inkFaint, letterSpacing: 0.4 }}>SORT</span>
+        <div style={{ display: "flex", gap: 6, flexWrap: "wrap" }}>
+          {[["status", "Overdue first"], ["name", "A–Z"], ["city", "By city"], ["recent", "Longest gap"]].map(([k, label]) => (
+            <button key={k} onClick={() => setSort(k)} style={{
+              cursor: "pointer", borderRadius: 999, padding: "5px 11px", fontSize: 12, fontWeight: 700,
+              border: `1px solid ${sort === k ? T.brass : T.line}`,
+              background: sort === k ? `${T.brass}22` : "transparent",
+              color: sort === k ? T.brassHi : T.inkDim,
+            }}>
+              {label}
+            </button>
+          ))}
+        </div>
+      </div>
+
+      {accounts.length > 0 && (
+        <div style={{ fontSize: 11.5, color: T.inkFaint, marginTop: -4 }}>
+          Tap an account to see details and log a contact · tap <b style={{ color: T.brass }}>+</b> to add it to a trip selection.
+        </div>
+      )}
+
+      {accounts.length === 0 ? (
+        <div style={{ background: T.card, border: `1px dashed ${T.line}`, borderRadius: 14, padding: "30px 22px", textAlign: "center" }}>
+          {totalCount === 0 ? (
+            <>
+              <div style={{ fontWeight: 800, color: T.ink, fontSize: 16, marginBottom: 8 }}>Start your book</div>
+              <div style={{ color: T.inkDim, fontSize: 13.5, lineHeight: 1.55, maxWidth: 340, margin: "0 auto 14px" }}>
+                No accounts yet. Add one by hand with <b style={{ color: T.brass }}>+ Add account</b> — capture its location with GPS while you're there — or bring your whole list in on the Import tab.
+              </div>
+              <button onClick={() => setAdding(true)} style={{
+                cursor: "pointer", border: "none", borderRadius: 10,
+                background: `linear-gradient(135deg, ${T.brass}, ${T.brassHi})`,
+                color: "#241a10", fontWeight: 800, fontSize: 13.5, padding: "10px 18px",
+              }}>
+                + Add your first account
+              </button>
+            </>
+          ) : (
+            <>
+              <div style={{ fontWeight: 700, color: T.ink, marginBottom: 6 }}>Nothing matches this filter</div>
+              <div style={{ color: T.inkDim, fontSize: 13.5 }}>Switch the filter above to see your other accounts.</div>
+            </>
+          )}
+        </div>
+      ) : (
+        <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 14, overflow: "hidden" }}>
+          {withHeaders.map((item, i) => {
+            if (item.type === "head") {
+              return (
+                <div key={`h-${item.city}`} style={{
+                  padding: "9px 14px", background: T.bg2, fontSize: 11, letterSpacing: 0.6,
+                  color: T.inkFaint, fontWeight: 700, borderTop: i ? `1px solid ${T.line}` : "none",
+                }}>
+                  {item.city.toUpperCase()}
+                </div>
+              );
+            }
+            const a = item.a;
+            const s = deriveStatus(a);
+            const sel = selectedIds.has(a.id);
+            const noLoc = a.lat == null;
+            return (
+              <div
+                key={a.id}
+                style={{
+                  display: "flex", alignItems: "center", gap: 12,
+                  width: "100%", boxSizing: "border-box", padding: "12px 14px",
+                  borderTop: i ? `1px solid ${T.line}` : "none",
+                  background: sel ? `${T.brass}14` : "transparent",
+                }}
+              >
+                <button
+                  onClick={() => onOpenDetail(a.id)}
+                  style={{
+                    all: "unset", cursor: "pointer", display: "flex", alignItems: "center", gap: 12,
+                    flex: 1, minWidth: 0,
+                  }}
+                >
+                  <Dot color={STATUS[s].color} size={10} hollow={a.confidence === "approx"} />
+                  <div style={{ flex: 1, minWidth: 0 }}>
+                    <div style={{ fontSize: 14.5, fontWeight: 600, color: T.ink, display: "flex", alignItems: "center", gap: 7 }}>
+                      {a.name}
+                      {noLoc && <span style={{ fontSize: 10.5, color: T.amber, border: `1px solid ${T.amber}44`, borderRadius: 5, padding: "0 5px" }}>no pin</span>}
+                    </div>
+                    <div style={{ fontSize: 12, color: T.inkFaint, marginTop: 2 }}>
+                      {STATUS[s].label} · {a.city} · {lastContactLabel(a.lastContact)}
+                    </div>
+                  </div>
+                </button>
+                <button
+                  onClick={() => onToggleRow(a.id)}
+                  aria-label={sel ? "Remove from selection" : "Add to selection"}
+                  title={sel ? "In your selection — tap to remove" : "Add to selection for a trip"}
+                  style={{
+                    flexShrink: 0, width: 30, height: 30, borderRadius: 8, cursor: "pointer",
+                    border: `1px solid ${sel ? T.brass : T.line}`,
+                    background: sel ? T.brassHi : "transparent",
+                    color: sel ? "#241a10" : T.inkFaint,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    fontSize: 16, fontWeight: 800, lineHeight: 1,
+                  }}
+                >
+                  {sel ? "✓" : "+"}
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ----------------------------- DETAIL SHEET -----------------------------
+   Opens for a single selected account. Home of the core cadence action
+   (Log contact → resets the clock), plus cadence editing and delete. */
+function fmtDate(ts) {
+  return ts ? new Date(ts).toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" }) : "—";
+}
+function DetailSheet({ acct, onClose, onLogContact, onSetCadence, onDelete }) {
+  if (!acct) return null;
+  const status = deriveStatus(acct);
+  const sColor = STATUS[status].color;
+  const due = addDays(acct.lastContact || 0, acct.cadenceDays);
+  const locLabel = acct.lat == null ? "No location yet"
+    : acct.source === "gps" ? "GPS pin (exact)"
+    : acct.confidence === "approx" ? "Geocoded (approximate)"
+    : "Exact location";
+
+  return (
+    <div
+      onClick={onClose}
+      style={{
+        position: "fixed", inset: 0, background: "rgba(8,5,3,.6)",
+        display: "flex", alignItems: "flex-end", justifyContent: "center", zIndex: 1000,
+        animation: "fade .2s both",
+      }}
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        style={{
+          width: "100%", maxWidth: 520, background: T.bg2,
+          borderTopLeftRadius: 22, borderTopRightRadius: 22,
+          border: `1px solid ${T.line}`, borderBottom: "none",
+          padding: 22, maxHeight: "85vh", overflow: "auto",
+          animation: "sheetUp .28s cubic-bezier(.2,.8,.2,1) both",
+        }}
+      >
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", gap: 12 }}>
+          <div style={{ minWidth: 0 }}>
+            <h2 style={{ margin: 0, fontSize: 21, color: T.ink, letterSpacing: 0.2 }}>{acct.name}</h2>
+            <div style={{ color: T.inkDim, fontSize: 13.5, marginTop: 3 }}>{acct.city}</div>
+          </div>
+          <span style={{
+            display: "inline-flex", alignItems: "center", gap: 6, flexShrink: 0,
+            fontSize: 11.5, fontWeight: 700, color: sColor, background: `${sColor}1c`,
+            border: `1px solid ${sColor}44`, padding: "4px 10px", borderRadius: 999,
+          }}>
+            <Dot color={sColor} size={7} /> {STATUS[status].label}
+          </span>
+        </div>
+
+        {/* facts */}
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 10, marginTop: 16 }}>
+          <Fact label="LAST CONTACT" value={lastContactLabel(acct.lastContact)} sub={acct.lastContact ? fmtDate(acct.lastContact) : "no contact logged"} />
+          <Fact label="NEXT DUE" value={acct.lastContact ? fmtDate(due) : "now"} sub={`every ${acct.cadenceDays} days`} />
+          <Fact label="LOCATION" value={locLabel} sub={acct.lat != null ? `${acct.lat.toFixed(4)}, ${acct.lng.toFixed(4)}` : (acct.address || "add an address")} />
+          <Fact label="ON MAP" value={acct.lat != null ? "Yes" : "Not yet"} sub={acct.lat == null ? "use GPS or an address" : ""} />
+        </div>
+
+        {/* core action */}
+        <button
+          onClick={() => onLogContact(acct.id)}
+          style={{
+            width: "100%", marginTop: 18, cursor: "pointer", border: "none", borderRadius: 12,
+            background: `linear-gradient(135deg, ${T.brass}, ${T.brassHi})`,
+            color: "#241a10", fontWeight: 800, fontSize: 15.5, padding: "15px 0",
+          }}
+        >
+          Log contact — today
+        </button>
+        <div style={{ fontSize: 11.5, color: T.inkFaint, textAlign: "center", marginTop: 7 }}>
+          Resets the cadence clock and turns {acct.name} green until it's due again.
+        </div>
+
+        {/* cadence */}
+        <div style={{ marginTop: 20 }}>
+          <div style={{ fontSize: 11, letterSpacing: 0.6, color: T.inkFaint, marginBottom: 8 }}>CONTACT CADENCE</div>
+          <div style={{ display: "flex", gap: 8 }}>
+            {[90, 180, 365].map((d) => (
+              <button key={d} onClick={() => onSetCadence(acct.id, d)} style={{
+                flex: 1, cursor: "pointer", borderRadius: 10, padding: "11px 0", fontSize: 13.5, fontWeight: 700,
+                border: `1px solid ${acct.cadenceDays === d ? T.brass : T.line}`,
+                background: acct.cadenceDays === d ? `${T.brass}22` : "transparent",
+                color: acct.cadenceDays === d ? T.brassHi : T.inkDim,
+              }}>
+                {d} days
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* destructive */}
+        <button
+          onClick={() => { if (confirm(`Delete ${acct.name}? This can't be undone.`)) { onDelete(acct.id); onClose(); } }}
+          style={{
+            width: "100%", marginTop: 22, cursor: "pointer", borderRadius: 11,
+            border: `1px solid ${T.rust}55`, background: "transparent", color: T.rust,
+            fontWeight: 700, fontSize: 13.5, padding: "12px 0",
+          }}
+        >
+          Delete account
+        </button>
+        <button
+          onClick={onClose}
+          style={{
+            width: "100%", marginTop: 8, cursor: "pointer", borderRadius: 11,
+            border: `1px solid ${T.line}`, background: "transparent", color: T.inkDim,
+            fontWeight: 600, fontSize: 13.5, padding: "12px 0",
+          }}
+        >
+          Close
+        </button>
+      </div>
+    </div>
+  );
+}
+function Fact({ label, value, sub }) {
+  return (
+    <div style={{ background: T.card, border: `1px solid ${T.line}`, borderRadius: 11, padding: "11px 13px" }}>
+      <div style={{ fontSize: 10.5, letterSpacing: 0.5, color: T.inkFaint }}>{label}</div>
+      <div style={{ fontSize: 14.5, fontWeight: 700, color: T.ink, marginTop: 3 }}>{value}</div>
+      {sub && <div style={{ fontSize: 11, color: T.inkFaint, marginTop: 2 }}>{sub}</div>}
+    </div>
+  );
+}
+
+/* ----------------------------- APP ----------------------------- */
+export default function Wayline() {
+  const [accounts, setAccounts] = useState([]);     // starts empty; storage hydrates on mount
+  const [loaded, setLoaded] = useState(false);      // true once initial load resolves
+  const [saveState, setSaveState] = useState("idle"); // idle | saving | saved | error
+  const [tab, setTab] = useState("list");
+  const [filter, setFilter] = useState("all");
+  const [sort, setSort] = useState("status");
+  const [selectedIds, setSelectedIds] = useState(() => new Set());
+  const [drawMode, setDrawMode] = useState(false);
+  const [wide, setWide] = useState(false);
+
+  // hydrate from storage once on mount
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      const stored = await store.loadAccounts();
+      if (!cancelled) {
+        if (Array.isArray(stored)) {
+          setAccounts(stored);
+          // keep the id counter ahead of any restored ids
+          const maxId = stored.reduce((m, a) => Math.max(m, a.id || 0), 0);
+          if (maxId >= _id) _id = maxId;
+        }
+        setLoaded(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  // persist whenever accounts change — but not during the initial load
+  useEffect(() => {
+    if (!loaded) return;
+    let cancelled = false;
+    setSaveState("saving");
+    (async () => {
+      const ok = await store.saveAccounts(accounts);
+      if (!cancelled) {
+        setSaveState(ok ? "saved" : "error");
+        if (ok) setTimeout(() => { if (!cancelled) setSaveState("idle"); }, 1500);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [accounts, loaded]);
+
+  // responsive: true side-by-side when there's room, linked tabs on phone
+  useEffect(() => {
+    const mq = window.matchMedia("(min-width: 900px)");
+    const apply = () => setWide(mq.matches);
+    apply();
+    mq.addEventListener ? mq.addEventListener("change", apply) : mq.addListener(apply);
+    return () => { mq.removeEventListener ? mq.removeEventListener("change", apply) : mq.removeListener(apply); };
+  }, []);
+
+  // filter controls which accounts BOTH views show and the lasso can catch
+  const shown = useMemo(() => {
+    return accounts.filter((a) => {
+      if (filter === "all") return true;
+      const s = deriveStatus(a);
+      if (filter === "overdue") return s === "overdue";
+      if (filter === "due") return s === "due" || s === "soon";
+      if (filter === "ok") return s === "ok";
+      return true;
+    });
+  }, [accounts, filter]);
+
+  // lasso replaces the selection; the list toggles rows additively
+  const handleSelect = (ids) => setSelectedIds(new Set(ids));
+  const toggleRow = (id) =>
+    setSelectedIds((prev) => { const n = new Set(prev); n.has(id) ? n.delete(id) : n.add(id); return n; });
+  const toggleOne = (id) =>
+    setSelectedIds((prev) => { const n = new Set(prev); n.delete(id); return n; });
+  const clearSel = () => setSelectedIds(new Set());
+
+  // wipe stored data back to empty (for testing / starting fresh)
+  const resetAll = async () => {
+    await store.clear();
+    setAccounts([]);
+    setSelectedIds(new Set());
+  };
+
+  // --- single-account actions (detail sheet) ---
+  const [detailId, setDetailId] = useState(null);
+  const logContact = (id) =>
+    setAccounts((prev) => prev.map((a) => a.id === id ? { ...a, lastContact: now() } : a));
+  const setCadenceFor = (id, days) =>
+    setAccounts((prev) => prev.map((a) => a.id === id ? { ...a, cadenceDays: days } : a));
+  const deleteAccount = (id) => {
+    setAccounts((prev) => prev.filter((a) => a.id !== id));
+    setSelectedIds((prev) => { const n = new Set(prev); n.delete(id); return n; });
+  };
+
+  // load seed accounts on demand (handy for trying the app without real data)
+  const loadSeed = () => {
+    setAccounts(SEED.map((a) => ({ ...a })));
+  };
+
+  const importAccounts = (rows) => {
+    setAccounts((prev) => [...prev, ...rows]);
+    setTab("list");
+  };
+
+  // Add one account: commit immediately, then locate in the background.
+  // GPS (if captured) is the most accurate fix and sets the pin directly.
+  const addAccount = (data) => {
+    const id = ++_id;
+    const hasGps = data.gps && typeof data.gps.lat === "number";
+    const acct = {
+      id, name: data.name, city: data.city, address: data.address || "",
+      lat: hasGps ? data.gps.lat : null,
+      lng: hasGps ? data.gps.lng : null,
+      source: hasGps ? "gps" : "",
+      confidence: hasGps ? "exact" : (data.address ? null : "none"),
+      cadenceDays: data.cadenceDays, lastContact: null,
+    };
+    setAccounts((prev) => [...prev, acct]); // saved right away, no network in the path
+    // Only geocode when there's no GPS fix — GPS already beats an address lookup.
+    if (!hasGps && data.address) {
+      geocodeOne(acct).then((r) => {
+        if (r.lat != null) {
+          setAccounts((prev) => prev.map((a) =>
+            a.id === id ? { ...a, lat: r.lat, lng: r.lng, confidence: r.confidence, source: r.source } : a));
+        } else {
+          setAccounts((prev) => prev.map((a) => a.id === id ? { ...a, confidence: "none" } : a));
+        }
+      }).catch(() => {});
+    }
+  };
+
+  const counts = useMemo(() => {
+    let located = 0, need = 0;
+    accounts.forEach((a) => (a.lat != null ? located++ : need++));
+    return { located, need, total: accounts.length };
+  }, [accounts]);
+
+  return (
+    <div style={{
+      minHeight: "100vh", background: `radial-gradient(120% 80% at 50% 0%, ${T.bg2}, ${T.bg})`,
+      color: T.ink, fontFamily: "'Inter', system-ui, sans-serif", paddingBottom: 60,
+    }}>
+      <style>{`
+        @keyframes riseIn { from { opacity:0; transform:translateY(8px) } to { opacity:1; transform:none } }
+        @keyframes fade { from { opacity:0 } to { opacity:1 } }
+        @keyframes sheetUp { from { transform:translateY(40px); opacity:0 } to { transform:none; opacity:1 } }
+        .leaflet-container { background:${T.bg2} !important; font-family:inherit }
+        * { -webkit-tap-highlight-color: transparent }
+      `}</style>
+
+      <div style={{ maxWidth: wide ? 1180 : 620, margin: "0 auto", padding: "24px 16px 0" }}>
+        <div style={{ display: "flex", alignItems: "baseline", gap: 10 }}>
+          <h1 style={{
+            margin: 0, fontSize: 25, fontWeight: 800, letterSpacing: -0.5,
+            background: `linear-gradient(120deg, ${T.brassHi}, ${T.brass})`,
+            WebkitBackgroundClip: "text", WebkitTextFillColor: "transparent",
+          }}>
+            Wayline
+          </h1>
+          <span style={{ fontSize: 12.5, color: T.inkFaint }}>your book and your territory, one view</span>
+          <span style={{ marginLeft: "auto", fontSize: 11.5, color: saveState === "error" ? T.rust : T.inkFaint, minWidth: 56, textAlign: "right" }}>
+            {saveState === "saving" ? "Saving…" : saveState === "saved" ? "✓ Saved" : saveState === "error" ? "Save failed" : !store.available() ? "Not saved*" : ""}
+          </span>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: 12, fontSize: 12.5, color: T.inkDim, marginTop: 8 }}>
+          <span>
+            {counts.located} of {counts.total} accounts located
+            {counts.need > 0 && <span style={{ color: T.amber }}> · {counts.need} need a location</span>}
+          </span>
+          {counts.total === 0 && loaded && (
+            <button onClick={loadSeed} style={{
+              cursor: "pointer", border: `1px solid ${T.line}`, background: "transparent",
+              color: T.brass, fontWeight: 700, fontSize: 12, borderRadius: 8, padding: "5px 10px",
+            }}>
+              Load sample data
+            </button>
+          )}
+          {counts.total > 0 && (
+            <button onClick={() => { if (confirm("Clear all accounts? This can't be undone.")) resetAll(); }} style={{
+              marginLeft: "auto", cursor: "pointer", border: `1px solid ${T.line}`, background: "transparent",
+              color: T.inkFaint, fontWeight: 600, fontSize: 12, borderRadius: 8, padding: "5px 10px",
+            }}>
+              Reset
+            </button>
+          )}
+        </div>
+        {!store.available() && (
+          <div style={{ fontSize: 11, color: T.inkFaint, marginTop: 6 }}>
+            *Storage isn't available here, so changes won't survive a reload in this preview.
+          </div>
+        )}
+      </div>
+
+      {/* shared filter bar — drives list, map, and lasso catch */}
+      <div style={{ maxWidth: wide ? 1180 : 620, margin: "0 auto", padding: "14px 16px 0" }}>
+        <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+          {[["all", "All"], ["overdue", "Overdue"], ["due", "Due"], ["ok", "Current"]].map(([k, label]) => (
+            <button key={k} onClick={() => setFilter(k)} style={{
+              cursor: "pointer", borderRadius: 999, padding: "7px 15px", fontSize: 13, fontWeight: 700,
+              border: `1px solid ${filter === k ? T.brass : T.line}`,
+              background: filter === k ? `${T.brass}22` : "transparent",
+              color: filter === k ? T.brassHi : T.inkDim,
+            }}>
+              {label}
+            </button>
+          ))}
+          <div style={{ marginLeft: "auto", display: "flex", alignItems: "center", fontSize: 12.5, color: T.inkDim }}>
+            {selectedIds.size > 0 ? `${selectedIds.size} selected` : `${shown.length} shown`}
+          </div>
+        </div>
+      </div>
+
+      {/* tabs — only when narrow; wide screens show both at once */}
+      {!wide && (
+        <div style={{ position: "sticky", top: 0, zIndex: 20, background: `${T.bg}f2`, backdropFilter: "blur(8px)", borderBottom: `1px solid ${T.line}`, marginTop: 14 }}>
+          <div style={{ maxWidth: 620, margin: "0 auto", display: "flex", padding: "0 12px" }}>
+            {[["list", "List"], ["map", "Map"], ["selection", "Selection"], ["import", "Import"]].map(([k, label]) => (
+              <button key={k} onClick={() => setTab(k)} style={{
+                flex: 1, cursor: "pointer", background: "none", border: "none", padding: "13px 0",
+                fontSize: 13, fontWeight: 700, color: tab === k ? T.brassHi : T.inkFaint,
+                borderBottom: `2px solid ${tab === k ? T.brass : "transparent"}`,
+                display: "inline-flex", alignItems: "center", justifyContent: "center", gap: 5,
+              }}>
+                {label}
+                {k === "selection" && selectedIds.size > 0 && (
+                  <span style={{ fontSize: 10, fontWeight: 800, color: "#241a10", background: T.brassHi, borderRadius: 999, padding: "1px 6px" }}>
+                    {selectedIds.size}
+                  </span>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* WIDE: list + map side by side, selection + import below */}
+      {wide ? (
+        <div style={{ maxWidth: 1180, margin: "0 auto", padding: "16px" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(340px, 440px) 1fr", gap: 16, alignItems: "start" }}>
+            <div>
+              <AccountList accounts={shown} totalCount={accounts.length} selectedIds={selectedIds} onToggleRow={toggleRow} onOpenDetail={setDetailId} sort={sort} setSort={setSort} onAddAccount={addAccount} />
+            </div>
+            <div style={{ position: "sticky", top: 16, display: "flex", flexDirection: "column", gap: 14 }}>
+              <TerritoryMap accounts={shown} selectedIds={selectedIds} onSelect={handleSelect} onOpenDetail={setDetailId} drawMode={drawMode} setDrawMode={setDrawMode} />
+              <div style={{ fontSize: 12.5, color: T.inkFaint, lineHeight: 1.55 }}>
+                Solid pin = exact · dashed = approximate. Draw a loop to select an area, or tap accounts in the list.
+              </div>
+              <SelectionPanel accounts={accounts} selectedIds={selectedIds} onClear={clearSel} onToggle={toggleOne} />
+            </div>
+          </div>
+          <div style={{ marginTop: 24, borderTop: `1px solid ${T.line}`, paddingTop: 20 }}>
+            <ImportView onImport={importAccounts} />
+          </div>
+        </div>
+      ) : (
+        <div style={{ maxWidth: 620, margin: "0 auto", padding: "16px" }}>
+          {tab === "list" && (
+            <AccountList accounts={shown} totalCount={accounts.length} selectedIds={selectedIds} onToggleRow={toggleRow} onOpenDetail={setDetailId} sort={sort} setSort={setSort} onAddAccount={addAccount} />
+          )}
+
+          {tab === "map" && (
+            <div style={{ display: "flex", flexDirection: "column", gap: 14 }}>
+              <TerritoryMap accounts={shown} selectedIds={selectedIds} onSelect={handleSelect} onOpenDetail={setDetailId} drawMode={drawMode} setDrawMode={setDrawMode} />
+              <div style={{ fontSize: 12.5, color: T.inkFaint, lineHeight: 1.55 }}>
+                Solid pin = exact location · dashed pin = approximate. The filter sets which accounts show and your loop can catch. Tap a pin to select just that one.
+                {selectedIds.size > 0 && (
+                  <button onClick={() => setTab("selection")} style={{
+                    display: "block", marginTop: 8, cursor: "pointer", border: `1px solid ${T.brass}66`,
+                    background: "transparent", color: T.brass, fontWeight: 700, fontSize: 13, borderRadius: 9, padding: "9px 14px",
+                  }}>
+                    See {selectedIds.size} selected →
+                  </button>
+                )}
+              </div>
+            </div>
+          )}
+
+          {tab === "selection" && (
+            <SelectionPanel accounts={accounts} selectedIds={selectedIds} onClear={clearSel} onToggle={toggleOne} />
+          )}
+
+          {tab === "import" && <ImportView onImport={importAccounts} />}
+        </div>
+      )}
+
+      <DetailSheet
+        acct={detailId != null ? accounts.find((a) => a.id === detailId) : null}
+        onClose={() => setDetailId(null)}
+        onLogContact={logContact}
+        onSetCadence={setCadenceFor}
+        onDelete={deleteAccount}
+      />
+    </div>
+  );
+}

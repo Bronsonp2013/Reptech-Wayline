@@ -1,0 +1,10 @@
+node_modules
+.next
+out
+build
+coverage
+generated
+package-lock.json
+# Leave the spec docs and prototype formatting untouched
+WAYLINE_*.md
+WAYLINE_UI_REFERENCE.jsx.txt

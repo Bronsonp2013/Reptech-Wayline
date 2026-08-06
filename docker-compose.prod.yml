@@ -1,0 +1,52 @@
+# Wayline — PRODUCTION stack (WAYLINE_BUILD.md §7). Run on the UGreen NAS.
+#
+#   docker compose -f docker-compose.prod.yml --env-file .env.production up -d --build
+#
+# The `--env-file` flag feeds BOTH ${...} interpolation here and the app's runtime
+# env. Postgres is NOT published to the host or internet — it lives only on this
+# compose network. Nothing is published: cloudflared reaches the app internally at
+# wayline-app:3000 and exposes it via an outbound-only Cloudflare Tunnel (no open
+# inbound ports on the home network).
+
+name: wayline
+
+services:
+  wayline-db:
+    image: postgres:16
+    container_name: wayline-db
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - wayline-db-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  wayline-app:
+    build: .
+    image: wayline-app:latest
+    container_name: wayline-app
+    restart: unless-stopped
+    env_file: .env.production
+    depends_on:
+      wayline-db:
+        condition: service_healthy
+    # No ports published — cloudflared reaches it at wayline-app:3000 on this network.
+
+  cloudflared:
+    image: cloudflare/cloudflared:latest
+    container_name: wayline-cloudflared
+    restart: unless-stopped
+    command: tunnel --no-autoupdate run
+    environment:
+      - TUNNEL_TOKEN=${TUNNEL_TOKEN}
+    depends_on:
+      - wayline-app
+
+volumes:
+  wayline-db-data:
