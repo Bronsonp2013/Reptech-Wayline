@@ -1,9 +1,11 @@
 // proxy.ts — Next 16's request middleware (renamed from middleware.ts).
 // Two hardening concerns (WAYLINE_SECURITY.md §6):
 //
-//  1. CSRF: state-changing API requests must be same-origin. With SameSite=Lax
+//  1. CSRF: state-changing requests must be same-origin. With SameSite=Lax
 //     cookies this closes the residual top-level-POST hole. We reject when an
 //     Origin header is present and its host doesn't match the request host.
+//     The check covers EVERY non-safe method, not just /api/ — Server Actions
+//     POST to page routes, so an /api/-only gate would silently skip them.
 //
 //  2. CSP: a per-request nonce for scripts (Next auto-applies it to its own
 //     script tags via 'strict-dynamic'), so no 'unsafe-inline' for scripts.
@@ -15,15 +17,34 @@ import { NextResponse, type NextRequest } from "next/server";
 
 const SAFE_METHODS = new Set(["GET", "HEAD", "OPTIONS"]);
 
+// Host of an Origin header, or null when it can't be trusted as same-origin.
+// `Origin: null` is a real value (sandboxed iframes, some cross-origin redirects,
+// file://) and `new URL("null")` throws — an unhandled throw here would surface as
+// a 500 instead of the 403 we mean. Opaque and malformed both resolve to null.
+function trustedOriginHost(origin: string): string | null {
+  if (origin === "null") return null;
+  try {
+    return new URL(origin).host;
+  } catch {
+    return null;
+  }
+}
+
 export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
 
-  // --- CSRF: same-origin enforcement on API mutations ---
-  if (pathname.startsWith("/api/") && !SAFE_METHODS.has(request.method)) {
+  // --- CSRF: same-origin enforcement on every mutation ---
+  if (!SAFE_METHODS.has(request.method)) {
     const origin = request.headers.get("origin");
     const host = request.headers.get("host");
-    if (origin && new URL(origin).host !== host) {
-      return NextResponse.json({ error: "Cross-origin request blocked." }, { status: 403 });
+    // A missing Origin stays allowed: browsers always send it on POST/PATCH/DELETE,
+    // so this only lets through non-browser clients (curl, the live API drives) that
+    // carry no ambient cookies to abuse. Present-but-untrustworthy is blocked.
+    if (origin !== null && trustedOriginHost(origin) !== host) {
+      const body = "Cross-origin request blocked.";
+      return pathname.startsWith("/api/")
+        ? NextResponse.json({ error: body }, { status: 403 })
+        : new NextResponse(body, { status: 403 });
     }
   }
 

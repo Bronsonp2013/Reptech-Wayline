@@ -1,0 +1,74 @@
+# CI — mechanizes the WAYLINE_SECURITY.md §11 checklist items that a machine can
+# actually verify: the suite (incl. the cross-tenant isolation test), types, lint,
+# and a dependency audit. Everything else in §11 stays a human review step.
+name: CI
+
+on:
+  push:
+    branches: [main, "claude/**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+
+    services:
+      # The tenant-isolation tests are DB-backed (WAYLINE_SECURITY.md §4), so the
+      # suite needs a real Postgres — not a mock.
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: wayline
+          POSTGRES_PASSWORD: wayline_ci
+          POSTGRES_DB: wayline
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd "pg_isready -U wayline -d wayline"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      DATABASE_URL: postgresql://wayline:wayline_ci@localhost:5433/wayline?schema=public
+      # CI-only throwaway value; real secrets never live in the workflow.
+      SESSION_SECRET: ci_only_placeholder_secret_not_used_in_any_deployment
+      NEXT_TELEMETRY_DISABLED: "1"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # `npm ci` runs postinstall → prisma generate, which needs prisma/schema.prisma.
+      - name: Install
+        run: npm ci
+
+      - name: Apply migrations
+        run: npx prisma migrate deploy
+
+      # Prisma 7: migrate does not reliably refresh the generated client
+      # (WAYLINE_BUILD.md Session 1 note), so regenerate explicitly.
+      - name: Regenerate Prisma client
+        run: npm run db:generate
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Format check
+        run: npm run format:check
+
+      - name: Test
+        run: npm test
+
+      # Production dependency tree only — dev-tool advisories are triaged separately
+      # (WAYLINE_BUILD.md Session 6) and shouldn't gate a deploy.
+      - name: Audit (production deps)
+        run: npm audit --omit=dev --audit-level=high

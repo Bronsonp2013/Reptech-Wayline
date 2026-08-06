@@ -1,9 +1,10 @@
 # Production image for wayline-app (WAYLINE_BUILD.md §7).
 #
-# Keeps full dependencies (incl. the Prisma CLI + seed tooling) so the SAME image
-# also runs `prisma migrate deploy` and `db:seed`. Native modules
-# (@node-rs/argon2, sharp) are compiled inside the linux container — host
-# node_modules are never copied in (wrong architecture).
+# Keeps the Prisma CLI + seed tooling (`prisma`, `tsx` are runtime dependencies) so
+# the SAME image also runs `prisma migrate deploy` and `db:seed` — but the build-only
+# toolchain is pruned from the final layer. Native modules (@node-rs/argon2) are
+# compiled inside the linux container — host node_modules are never copied in
+# (wrong architecture).
 
 # --- deps: install with schema present so postinstall `prisma generate` works ---
 FROM node:20-slim AS deps
@@ -31,6 +32,13 @@ WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=build /app ./
+# Drop devDependencies (eslint, vitest, jsdom, typescript, prettier, @types/*) from the
+# shipped image — they're build-time only and are pure attack surface in production.
+# `prisma` + `tsx` survive as runtime deps, so migrate/seed still run from this image.
+RUN npm prune --omit=dev
+# Run unprivileged (WAYLINE_SECURITY.md §9). The node base image ships a `node` user.
+RUN chown -R node:node /app
+USER node
 EXPOSE 3000
 # /api/health returns 200 only when Postgres answers — a real readiness signal.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
