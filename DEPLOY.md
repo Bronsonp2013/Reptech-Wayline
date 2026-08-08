@@ -115,6 +115,41 @@ gunzip -c wayline-YYYY-MM-DD.sql.gz | \
 
 ---
 
+## Carried risks — verify these during the deploy
+
+Consciously accepted during Sessions 5–6 and fine for v1, but they were buried in
+BUILD LOG cells where nobody re-reads them. Each is either a check to run here or a
+constraint to respect. Tick them as part of Session 7.
+
+- [ ] **Host header through the tunnel.** The CSRF defense in `proxy.ts` compares the
+      `Origin` host against the request `Host`. If Cloudflare Tunnel rewrites `Host`,
+      every same-origin mutation starts 403-ing. **Verify once, live:** log in over the
+      public hostname and log an interaction. A 403 here means the tunnel is rewriting —
+      compare against the public hostname instead of `Host`.
+- [ ] **Single Node process only.** The geocode worker (`lib/geocodeWorker.ts`) drains
+      its queue in-process with no lock. Scaling `wayline-app` past one replica would
+      double-geocode and burn the Nominatim courtesy limit. Multi-instance needs a
+      locking queue behind the same enqueue/kick interface — don't scale until then.
+- [ ] **`npm audit` before every deploy — do not trust a past triage.** Session 6 recorded
+      "5 moderate, all dev-only, accepted"; by 2026-08 that had gone stale and Next 16.2.9
+      was carrying 9 advisories, including a **Middleware/Proxy bypass**
+      (`GHSA-6gpp-xcg3-4w24`) — a bypass of the CSP + CSRF layer in `proxy.ts` itself.
+      Fixed by the 16.3.0 bump; the tree is clean as of 2026-08-08. CI runs
+      `npm audit --omit=dev --audit-level=high`, but re-run it at deploy time too.
+- [ ] **`pg_dump` scheduled AND a restore verified.** Until the cron below exists, the
+      only protection for Brian's book is the Docker volume. A backup you have never
+      restored is not a backup.
+- [ ] **Container runs as `node`, not root.** Confirm with
+      `docker compose -f docker-compose.prod.yml exec wayline-app id` → expect uid≠0.
+
+Accepted permanently, no action needed:
+
+- **`style-src 'unsafe-inline'`** in the CSP. Unavoidable while status colors and Leaflet
+  marker positions ride on inline `style` attributes — those can't carry a nonce. Scripts
+  are still nonce-gated with `strict-dynamic`, which is where the real XSS risk lives.
+
+---
+
 ## Security invariants (don't regress these)
 
 - **No published ports** on either DB or app — only cloudflared talks outward.
