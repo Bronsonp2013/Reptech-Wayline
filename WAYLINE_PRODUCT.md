@@ -1,5 +1,10 @@
 # WAYLINE — Product Spec
 
+> ⚠️ **Superseded in part.** Where this document conflicts with
+> `WAYLINE_MASTER_PLAN.md` or `WAYLINE_CADENCE_PATCH.md`, those files win.
+> Known correction: three interaction types (`visit` / `call` / `catalogs_updated`);
+> **only visits reset the cadence clock.**
+
 > The "what and why" behind Wayline. Pair with `WAYLINE_BUILD.md` (the how) and
 > `WAYLINE_DESIGN.md` (the look). When a feature decision is ambiguous during a
 > build session, this document is the tie-breaker.
@@ -51,7 +56,8 @@ drive he can hand to Google Maps or Waze.
 ### In scope (v1)
 - Account book with per-account contact cadence.
 - Cadence engine that flags overdue / due / current.
-- Contact logging (resets the cadence clock; records action type).
+- Interaction logging: **visits reset the cadence clock**; calls and catalog
+  updates log to history only.
 - Map of the territory with real-coordinate pins.
 - Lasso selection → trip building → hand-off to Google Maps / Waze.
 - Manual single-account add (with GPS capture) and bulk CSV import.
@@ -76,7 +82,7 @@ Keeping these out is a feature. Scope creep is the main risk to shipping in a mo
 ### Account
 A place Brian sells to or wants to: name, optional city/address, a location
 (lat/lng from GPS or geocoding), a **cadence** (how often it should be contacted),
-and a **last-contact** timestamp. Optionally a contact name.
+and a **last-visit** timestamp. Optionally a contact name.
 
 ### Cadence
 How many days between contacts for this account: **90 / 180 / 365** presets.
@@ -85,18 +91,21 @@ a quiet designer every 365). Cadence is **per-account and editable** — this is
 makes Wayline a product rather than a one-off list.
 
 ### Status (derived, never stored stale)
-From `lastContact + cadenceDays` vs. today:
-- **Overdue** — past due (or never contacted).
+From `lastVisitAt + cadenceDays` vs. today:
+- **Overdue** — past due (or never visited).
 - **Due now** — within 14 days of due.
 - **Due soon** — within 30 days.
 - **Current** — more than 30 days of runway.
 Status drives color everywhere (rust / amber / sage).
 
-### Contact log
-Logging a contact sets `lastContact = today` and records the **action type**
-(`contact` or `catalog_drop`) so a catalog drop-off is distinct from a qualifying
-call/visit. This is the core loop — the single action that moves an account from
-red back to green.
+### Interaction log
+Logging an interaction records the **action type** (`visit`, `call`, or
+`catalogs_updated`) so a catalog drop-off is distinct from a qualifying call, and
+both are distinct from a face-to-face visit. Only a **visit** sets
+`lastVisitAt = today`. This is the core loop — the single action that moves an
+account from red back to green. Calls and catalog updates are history only: they
+never move an account out of overdue, so no account silently lapses its required
+face-to-face cadence.
 
 ### Trip selection
 An ad-hoc set of accounts Brian is considering for a day, built by drawing a lasso
@@ -113,9 +122,11 @@ and location-less accounts surface in a "needs location" list rather than vanish
 
 ## 6. KEY FLOWS
 
-### Log a contact (the heartbeat)
-Open account → "Log contact — today" → cadence clock resets, status flips toward
-sage. This is the most-used action; it's one tap from the detail sheet.
+### Log a visit (the heartbeat)
+Open account → "Log visit — today" → cadence clock resets, status flips toward
+sage. This is the most-used action; it's one tap from the detail sheet. **Log call**
+and **Catalogs updated** sit alongside it as secondary actions — they record to
+history without touching the clock.
 
 ### Add an account in the field
 `+ Add account` → name/city/address/cadence → optionally "Use my location" for an
@@ -137,7 +148,7 @@ geocoder works through the queue.
 ## 7. DATA MODEL (product view)
 
 Per account: `name`, `city`, `address`, `lat`, `lng`, `confidence`, `source`,
-`cadenceDays`, `lastContact`, `contactName`, `geocodeState`, plus a history of
+`cadenceDays`, `lastVisitAt`, `contactName`, `geocodeState`, plus a history of
 `ContactLog` entries (`action`, `loggedAt`, `notes`). Every account belongs to a
 `user` (tenant). Nothing brand- or employer-specific lives in the core model.
 
@@ -169,7 +180,7 @@ Per account: `name`, `city`, `address`, `lat`, `lng`, `confidence`, `source`,
 - [ ] Brian can add accounts (manually with GPS, or by CSV import).
 - [ ] Addresses geocode in the background; pins appear without blocking.
 - [ ] The list shows accurate cadence status with sort + filter.
-- [ ] Logging a contact resets the clock and flips the status color.
+- [ ] Logging a **visit** resets the clock; logging a call or catalog update does not.
 - [ ] Cadence is editable per account.
 - [ ] The map shows real pins; the lasso selects an area.
 - [ ] A selection exports to Google Maps (multi-stop) and Waze (single).

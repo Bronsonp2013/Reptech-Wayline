@@ -1,5 +1,10 @@
 # WAYLINE — Full Build Spec & Claude Code Session Plan
 
+> ⚠️ **Superseded in part.** Where this document conflicts with
+> `WAYLINE_MASTER_PLAN.md` or `WAYLINE_CADENCE_PATCH.md`, those files win.
+> Known correction: three interaction types (`visit` / `call` / `catalogs_updated`);
+> **only visits reset the cadence clock.**
+
 > **What this document is.** A complete, self-contained spec for building Wayline
 > from scratch as a production web app, plus a session-by-session plan for driving
 > Claude Code. Save this file to your computer. In each Claude Code session, point
@@ -48,7 +53,7 @@ These are settled. Claude Code should not re-litigate them.
 | Timezones | All US timezones selectable per user; default America/Chicago (Brian). |
 | Platform | Responsive web app, **iOS-first layout**, works on Android. Installable as a **PWA**. |
 | Hosting | **Self-hosted in Docker on a UGreen DXP4800 Pro**, reached from the field via **Cloudflare Tunnel** (free, HTTPS, no open ports). |
-| Contact logging | Logs timestamp **and** action type (`contact` / `catalog_drop`), extensible. |
+| Contact logging | Logs timestamp **and** action type (visit / call / catalogs_updated). **Only 'visit' resets the cadence clock**; the other two are history-only. |
 | Deferred to post-v1 | Data export, CRM integrations, offline mode, push notifications, Stripe billing. |
 
 ---
@@ -117,7 +122,7 @@ model Account {
   lat          Float?
   lng          Float?
   cadenceDays  Int       @default(180)
-  lastContact  DateTime?
+  lastVisitAt  DateTime?                         // advanced ONLY by a 'visit' log
   source       String?                           // 'gps' | 'nominatim' | 'import' | 'none'
   confidence   String?                           // 'exact' | 'approx' | 'none'
   contactName  String?
@@ -134,7 +139,7 @@ model ContactLog {
   accountId String
   account   Account  @relation(fields: [accountId], references: [id], onDelete: Cascade)
   loggedAt  DateTime @default(now())
-  action    String   // 'contact' | 'catalog_drop'
+  action    String   // 'visit' | 'call' | 'catalogs_updated' — only 'visit' resets cadence
   notes     String?
 }
 
@@ -158,16 +163,17 @@ by the authenticated `userId`. No endpoint ever returns another user's data.
 - Add one account: name (required), city, address, cadence (90/180/365), contact name.
 - **GPS capture:** "Use my location" sets an exact pin, skips geocoding.
 - **Delete** with confirm.
-- **Detail sheet:** status, last contact, next due, location source, cadence editor, log-contact, delete.
+- **Detail sheet:** status, last visit, next due, location source, cadence editor, log visit / log call / catalogs updated, delete.
 
 ### Cadence engine (the core loop)
-- Status from `lastContact + cadenceDays` vs. today:
+- Status from `lastVisitAt + cadenceDays` vs. today:
   overdue (<0 days left), due (≤14), soon (≤30), current (>30).
-- **Log contact** sets `lastContact = now()` and writes a `ContactLog` row.
+- **Log visit** sets `lastVisitAt = now()` and writes a `ContactLog` row. **Log call**
+  and **Catalogs updated** write a `ContactLog` row only — they never advance the clock.
 - Status colors: rust (overdue) / amber (due/soon) / sage (current).
 
 ### List view
-- Rows: status dot, name, city, last-contact label.
+- Rows: status dot, name, city, last-visit label.
 - Sort: overdue-first / A–Z / by city / longest gap.
 - Filter: all / overdue / due / current (drives list AND map).
 - Tap row → detail. `+` button → add to trip selection.
@@ -227,7 +233,7 @@ POST   /api/accounts             create (queues geocode if address & no coords)
 GET    /api/accounts/:id
 PATCH  /api/accounts/:id         update (cadence, contact, name, coords, …)
 DELETE /api/accounts/:id
-POST   /api/accounts/:id/log     { action: 'contact' | 'catalog_drop', notes? }
+POST   /api/accounts/:id/log     { action: 'visit' | 'call' | 'catalogs_updated', notes? }
 
 POST   /api/import/preview       CSV text/file → parsed rows + confidence counts
 POST   /api/import/commit        rows → create accounts, enqueue geocode jobs
@@ -277,17 +283,17 @@ POST   /api/trips/waze           { accountId }    → { url }
 ### SESSION 2 — Account CRUD + cadence engine
 1. Implement `/api/accounts` GET/POST/PATCH/DELETE and `/api/accounts/:id/log`, all `userId`-scoped.
 2. Implement cadence status derivation server-side (overdue/due/soon/current) and expose it on account reads.
-3. Log-contact writes a `ContactLog` and updates `lastContact`.
-4. Unit-test the cadence math (the transitions: log flips overdue→current; never-contacted stays overdue; cadence change re-derives).
+3. Log-interaction writes a `ContactLog`; it updates `lastVisitAt` **only** when `action === 'visit'`.
+4. Unit-test the cadence math (the transitions: logging a **visit** flips overdue→current; logging a **call** does not; never-visited stays overdue; cadence change re-derives).
 **Done when:** full account lifecycle works via API and cadence status is correct and tested.
 
 ### SESSION 3 — Frontend: list + detail + cadence UI
 1. Build the app shell (tabs: List / Map / Selection / Import), dark theme tokens from §5.
 2. List view: rows, sort, filter (client reads the scoped API), empty "Start your book" state.
-3. Detail sheet: facts grid, **Log contact** button, cadence selector, delete.
+3. Detail sheet: facts grid, **Log visit** (brass primary) plus **Log call** / **Catalogs updated** (secondary), cadence selector, delete.
 4. Add-account form: name/city/address/cadence + **GPS capture** button.
 5. Wire everything to the API; confirm persistence across reload.
-**Done when:** Brian can add, view, log-contact, edit cadence, and delete from the UI, and it persists in Postgres.
+**Done when:** Brian can add, view, log a visit / call / catalogs-updated, edit cadence, and delete from the UI, and it persists in Postgres.
 
 ### SESSION 4 — Map + lasso + trip export
 1. Map view (Leaflet + CARTO dark), real-coordinate pins colored by status, solid/dashed by confidence.
@@ -363,3 +369,4 @@ POST   /api/trips/waze           { accountId }    → { url }
 | 6 | 2026-07-09 | PWA + hardening + QA. **Security headers** (`next.config.ts`): HSTS, X-Content-Type-Options nosniff, X-Frame-Options DENY, Referrer-Policy, Permissions-Policy (geolocation=(self) for GPS, else deny). **CSP + CSRF** in `proxy.ts` (Next 16 renamed middleware→proxy): per-request script **nonce** + `strict-dynamic` (no unsafe-inline scripts; `unsafe-eval` dev-only), `style-src 'unsafe-inline'` (inline style attrs can't be nonced), `img-src` allows CARTO tiles, `frame-ancestors 'none'`, everything else `'self'`; CSRF = same-origin check rejecting cross-origin API mutations (403). **PWA**: `app/manifest.ts` (standalone, warm-dark), brass-W PNG icons (192/512/apple, generated via sharp), install-only service worker (`public/sw.js`, no offline cache) registered by `components/ServiceWorker.tsx`. **GeocodeJob→Account FK cascade** migration (Session-5 follow-up). README rewritten (setup/scripts/security/update). **npm audit:** 5 moderate, all dev-only (prisma dev-deps→hono, build-time postcss) — the only "fix" downgrades Next to 9.x; triaged/accepted. **Done-when verified:** 65 tests green + tsc/ESLint clean; live: app loads + hydrates under the nonce CSP with **zero console violations**, CARTO tiles + Leaflet dynamic-import load fine, all 5 headers + CSP present on responses, **CSRF 403 on foreign Origin** (same-origin passes to 400/validation), manifest/sw.js/icons serve 200, SW registered. | Nonce CSP requires dynamic rendering — fine, `/` is already force-dynamic. `proxy.ts` uses `btoa` not `Buffer` (Edge runtime). Real phone install + on-device GPS/lasso QA is Bronson's to do post-deploy (can't drive a physical device here). `pg_dump` backup routine lands with the prod stack in Session 7. Two follow-ups accepted for v1: CSRF host-compare assumes Cloudflare preserves Host (revisit if the tunnel rewrites it); `unsafe-inline` styles unavoidable with inline style attributes. |
 | 7 | 2026-07-09 | **Deploy artifacts staged** (on-NAS deploy deferred — awaiting the UGreen's hard drives). `Dockerfile` (multi-stage deps→build→runner; full deps kept so the image also runs `prisma migrate deploy`/`db:seed`; native modules built in-container), `.dockerignore`, `docker-compose.prod.yml` (app + Postgres + `cloudflared`, **nothing published** — cloudflared reaches `wayline-app:3000` internally, DB on the compose network only, named volume `wayline-db-data`), `.env.production.example`, and `DEPLOY.md` (one-time setup, Cloudflare token tunnel → `wayline-app:3000`, migrate/seed/book-load, updates, `pg_dump` backup + restore-verify). `.gitignore` keeps `.env.production` secret while committing the template. **Verified (no NAS needed):** `docker compose -f docker-compose.prod.yml config` valid; **image builds clean** (linux argon2/sharp compiled, in-container prisma generate + `next build`, proxy/middleware recognized); the built image **runs `next start` and serves** (root 200) with the **production CSP** (`upgrade-insecure-requests`, no `unsafe-eval`) and connects via the runtime `DATABASE_URL`. | On-NAS steps remain (Bronson's, post-hardware): install drives + enable Docker, create the Cloudflare tunnel/token + public hostname, `compose up` + migrate + seed, load the book into prod, verify from a phone off-Wi-Fi, schedule the `pg_dump` cron. Container-to-container DB is guaranteed by compose service DNS (an ad-hoc `docker run` hit a Docker-Desktop `EAI_AGAIN` quirk — not an artifact issue). **Data note:** Dorann Prachyl's 232-account book is loaded in the **dev** DB (real cadence; 230 city-level pins); re-loads into prod at deploy. |
 | R1 | 2026-08-06 | **Review + remediation pass** (no feature work). **Secrets:** untracked `.env` — it reached the public repo via GitHub's web uploader, which bypasses `.gitignore`, exposing `SESSION_SECRET`, dev DB creds and a seed password (contradicting §7); also untracked `files.zip`, `tsconfig.tsbuildinfo`, `next-env.d.ts` and replaced the real email in `.env.production.example`. **`proxy.ts`:** `Origin: null` / malformed Origin made `new URL()` throw → 500 instead of the intended 403 (both now block); same-origin check widened from `/api/`-only to every non-safe method, since Server Actions POST to page routes. **Dockerfile:** runs as the `node` user (§9 required non-root; it ran as uid 0) and prunes devDependencies from the runner — `prisma`, `tsx`, `dotenv` moved to `dependencies` so the image still runs `migrate deploy`/`db:seed` (`prisma.config.ts` imports `dotenv/config`). **Deps:** Next **16.2.9 → 16.3.0**, `npm audit fix`, and all three Prisma packages aligned at **7.9.1** (audit fix moved the CLI alone, and a CLI/client skew is exactly the Session-1 generation trap). **CI:** added `.github/workflows/ci.yml` — install, `migrate deploy`, regenerate client, tsc, lint, format, tests against a real Postgres, and `npm audit --omit=dev --audit-level=high`. **Verified:** `proxy.ts` typechecks clean under 16.3.0 and passes an 8-case Origin drive (same-origin, cross-origin, opaque, malformed, absent, GET-exempt, both page-route directions); `npm audit` **0 vulnerabilities**. | **Session 6's "5 moderate, all dev-only" audit triage was stale** — by 2026-08 Next 16.2.9 carried 9 advisories incl. `GHSA-6gpp-xcg3-4w24` (**Middleware/Proxy bypass**, i.e. a bypass of this app's CSP+CSRF layer), Server-Action SSRF, and cache confusion. 16.3.0 clears all of them; re-check `npm audit` before each deploy rather than trusting a past triage. **Unverified here:** the Dockerfile (no Docker daemon in the review env) and CI (needs the source) — both need a real build before the NAS deploy. **Still open:** the leaked secrets are untracked but NOT rotated and remain in `main`'s history; `app/`, `lib/`, `components/`, `prisma/`, `tests/`, `public/` are still absent from the repo, so the tree cannot build. |
+| 6.5 | 2026-08-08 | **PARTIAL — docs only.** Cadence semantics correction per `WAYLINE_CADENCE_PATCH.md`. **Done:** patch spec committed to the repo root; superseded banners added verbatim to WAYLINE.md / WAYLINE_BUILD.md / WAYLINE_PRODUCT.md (§8a); WAYLINE.md data model → `lastVisitAt` + 3-type enum, cadence sentence now "latest **visit**" (§8b); WAYLINE_BUILD.md §2 locked-decisions row, §4 schema (`lastVisitAt`, action comment), §4/§5 status formula + log-visit/call/catalogs wording, §6 log route body, Session 2 steps 3–4 and Session 3 step 3 + both done-when lines (§8c); WAYLINE_PRODUCT.md §4 scope, §5 Interaction log + Account + Status, §6 "Log visit — today", §9 acceptance (§8d). §8e `git rm --cached` of `.env`/`files.zip`/`tsconfig.tsbuildinfo`/`next-env.d.ts` already landed in the review pass (commit d35517d). | **NOT DONE — §2–§7 are blocked, not skipped.** The application source has never been pushed to this repo: `app/`, `lib/`, `components/`, `prisma/`, `tests/`, `public/` are all absent (the 2026-08-06 web upload carried root-level files only). So the schema migration + data backfill (§2), `deriveCadence`/log-transaction visit-gating (§3), zod enum + route body (§4), the three-button DetailSheet and `store.logInteraction` (§5), all six test cases (§6), and the warn-window constant extraction (§7) have **no files to edit**. The docs now describe behavior the code does not implement — that gap closes only when the source lands and §2–§7 run. **Also outstanding:** `WAYLINE_MASTER_PLAN.md` was not supplied, so it is not committed even though the new banners reference it; and §8e's precondition — rotating `SESSION_SECRET`, the Postgres password and the seed credentials leaked in `fed1619` — has not been confirmed done. **Deviation logged:** three further `lastContact` references in WAYLINE_PRODUCT.md (Account concept, Status formula, §7 data model) were not enumerated in §8d but were corrected under §5's copy sweep — leaving them would have contradicted the new banner. Historical BUILD LOG rows (Sessions 0–7) were left verbatim: they record what shipped at the time, and rewriting them would falsify the log. |

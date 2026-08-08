@@ -1,5 +1,10 @@
 # Wayline
 
+> ⚠️ **Superseded in part.** Where this document conflicts with
+> `WAYLINE_MASTER_PLAN.md` or `WAYLINE_CADENCE_PATCH.md`, those files win.
+> Known correction: three interaction types (`visit` / `call` / `catalogs_updated`);
+> **only visits reset the cadence clock.**
+
 Field-sales cadence + territory tracker. Single-user v1 for Brian, a furniture manufacturer's rep in Texas. It answers two questions and nothing else: **"who needs me and when"** (cadence — the primary axis) and **"is this drive worth it"** (map/territory — the complementary axis). Time-driven first; the map is never the primary view.
 
 Fuller product spec, if present, lives in `docs/SPEC.md`.
@@ -31,11 +36,11 @@ Not a CRM. Not a routing/optimization engine. Not order entry. Not a team tool. 
 ```
 User       { id, email, passwordHash, timezone }
 Account    { id, userId, name, city, address, lat, lng,
-             confidence, source, cadenceDays, lastContactedAt }
-ContactLog { id, accountId, at, type }        // type: "contact" | "catalog_drop"
+             confidence, source, cadenceDays, lastVisitAt }
+ContactLog { id, accountId, at, type }        // type: "visit" | "call" | "catalogs_updated"  // only 'visit' resets the clock
 ```
 
-Cadence status is DERIVED (compare now − latest ContactLog.at to cadenceDays) in `lib/cadence.ts`. Never store status as a column. `confidence` ∈ exact | geocoded | low | needsLocation. `source` ∈ gps | import | geocode | manual.
+Cadence status is DERIVED (compare now − latest **visit** to cadenceDays) in `lib/cadence.ts`. Never store status as a column. `confidence` ∈ exact | geocoded | low | needsLocation. `source` ∈ gps | import | geocode | manual.
 
 ## Directory map
 
