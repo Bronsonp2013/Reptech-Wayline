@@ -12,6 +12,10 @@
 # this dev machine. DATABASE_URL in .env points at 5433 to match. Container-internal
 # port stays 5432.
 
+# Project name stays `wayline` (this is the long-standing dev stack and its volume
+# holds the working book). The PRODUCTION stack uses `wayline-prod` precisely so the
+# two can never resolve to the same Compose project or the same physical volume —
+# see the note in docker-compose.prod.yml.
 name: wayline
 
 services:

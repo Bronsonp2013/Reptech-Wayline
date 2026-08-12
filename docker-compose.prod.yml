@@ -7,8 +7,31 @@
 # compose network. Nothing is published: cloudflared reaches the app internally at
 # wayline-app:3000 and exposes it via an outbound-only Cloudflare Tunnel (no open
 # inbound ports on the home network).
+#
+# Two NAS-specific concerns are handled below, both of which bite in production
+# rather than in dev:
+#
+#  * **Log rotation.** Docker's default json-file driver grows without bound. On a
+#    NAS that ends as a full disk, which takes Postgres down with it. Every service
+#    caps its logs. Do not add a service without a `logging:` block.
+#  * **Rollback.** `IMAGE_TAG` lets a build be tagged by commit/date so the previous
+#    image survives the next deploy. With `:latest` alone, a bad deploy overwrites
+#    the only good image and there is nothing to roll back to.
 
-name: wayline
+# Deliberately NOT `wayline` — that is the dev stack's project name. If both files
+# shared it they would resolve to the same Compose project and the same physical
+# volume, so a bare `docker compose up -d` (no `-f`) on the NAS would attach the DEV
+# Postgres definition to PRODUCTION data and publish it on 127.0.0.1:5433, breaking
+# the "Postgres is never published" invariant asserted below. Distinct names also stop
+# Compose from treating the prod app/tunnel as orphans to prune.
+name: wayline-prod
+
+# Shared by every service — see the log-rotation note above.
+x-logging: &default-logging
+  driver: json-file
+  options:
+    max-size: "10m"
+    max-file: "3"
 
 services:
   wayline-db:
@@ -19,6 +42,10 @@ services:
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       POSTGRES_DB: ${POSTGRES_DB}
+      # Cadence is entirely date-driven, so container TZ is not cosmetic — a UTC
+      # container can flip an account's status a day early near midnight Central.
+      TZ: ${TZ:-America/Chicago}
+      PGTZ: ${TZ:-America/Chicago}
     volumes:
       - wayline-db-data:/var/lib/postgresql/data
     healthcheck:
@@ -26,27 +53,48 @@ services:
       interval: 5s
       timeout: 5s
       retries: 10
+    logging: *default-logging
+    # Modest ceiling for an N100 sharing the box with the app. Raise if Postgres
+    # starts OOMing under the real book; do not remove — an unbounded container
+    # can take the whole NAS down.
+    mem_limit: 1g
 
   wayline-app:
     build: .
-    image: wayline-app:latest
+    # Tag by commit or date at build time so the previous image survives:
+    #   IMAGE_TAG=2026-08-08 docker compose -f docker-compose.prod.yml up -d --build
+    image: wayline-app:${IMAGE_TAG:-latest}
     container_name: wayline-app
     restart: unless-stopped
     env_file: .env.production
+    environment:
+      TZ: ${TZ:-America/Chicago}
     depends_on:
       wayline-db:
         condition: service_healthy
+    logging: *default-logging
+    mem_limit: 1g
     # No ports published — cloudflared reaches it at wayline-app:3000 on this network.
 
   cloudflared:
-    image: cloudflare/cloudflared:latest
+    # Pinned, not `:latest`. `--no-autoupdate` stops the binary self-updating, but a
+    # re-pull on `:latest` would still jump to whatever Cloudflare last published — and
+    # a breaking cloudflared release takes the tunnel, and therefore the whole app,
+    # offline with nothing to fall back to. Bump this deliberately.
+    image: cloudflare/cloudflared:2026.8.0
     container_name: wayline-cloudflared
     restart: unless-stopped
     command: tunnel --no-autoupdate run
     environment:
       - TUNNEL_TOKEN=${TUNNEL_TOKEN}
     depends_on:
-      - wayline-app
+      # Gate on the app's real readiness (the Dockerfile HEALTHCHECK hits
+      # /api/health, which only passes when Postgres answers) so the tunnel never
+      # comes up pointing at a process that isn't listening yet.
+      wayline-app:
+        condition: service_healthy
+    logging: *default-logging
+    mem_limit: 128m
 
 volumes:
   wayline-db-data:

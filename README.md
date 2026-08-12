@@ -89,12 +89,17 @@ npm run dev                 # http://localhost:3000
 
 ## Updating (self-hosted)
 
-```bash
-git pull
-docker compose build wayline-app     # once the prod stack exists (Session 7)
-docker compose up -d
-npm run db:migrate                   # apply any new migrations
-```
+**Follow [`DEPLOY.md`](DEPLOY.md) — do not improvise the update from memory.** It is
+the single authority for the production sequence (backup → build → migrate → start)
+and for rollback.
+
+> ⚠️ **Never run `npm run db:migrate` against production.** It is
+> `prisma migrate dev`, a *development* command: it uses a shadow database and, on
+> any schema drift, offers to **reset the database** — i.e. drop Brian's book.
+> Production migrations are `prisma migrate deploy`, which only applies pending
+> migrations and never resets. Likewise, every production `docker compose` command
+> needs `-f docker-compose.prod.yml --env-file .env.production`; a bare
+> `docker compose up -d` starts the **dev** stack.
 
 Full deployment (Docker Compose + Cloudflare Tunnel on the UGreen NAS, plus the
 `pg_dump` backup routine) is Session 7 — see `WAYLINE_BUILD.md` §7–§8.

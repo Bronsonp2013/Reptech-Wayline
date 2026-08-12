@@ -41,7 +41,7 @@ jobs:
 
       - uses: actions/setup-node@v4
         with:
-          node-version: 20
+          node-version: 22
           cache: npm
 
       # `npm ci` runs postinstall → prisma generate, which needs prisma/schema.prisma.
@@ -67,6 +67,18 @@ jobs:
 
       - name: Test
         run: npm test
+
+      # `tsc --noEmit` does NOT catch what `next build` catches: Server/Client
+      # component boundary violations, static-generation errors, `window` touched on a
+      # server path, route-collection failures. Without this step those surface for the
+      # first time on the NAS, mid-deploy, after the running app has been torn down.
+      - name: Build
+        run: npm run build
+
+      # Exercise the Dockerfile itself — the multi-stage prune + non-root path is
+      # otherwise validated for the first time on a low-power NAS.
+      - name: Build production image
+        run: docker build -t wayline-app:ci .
 
       # Production dependency tree only — dev-tool advisories are triaged separately
       # (WAYLINE_BUILD.md Session 6) and shouldn't gate a deploy.

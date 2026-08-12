@@ -16,3 +16,8 @@ Account List
 *.xlsx
 .claude
 scratchpad
+.github
+# `*.md` above doesn't catch these — they'd otherwise ride into the image via `COPY . .`.
+*.txt
+files.zip
+*.tsbuildinfo

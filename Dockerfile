@@ -2,19 +2,21 @@
 #
 # Keeps the Prisma CLI + seed tooling (`prisma`, `tsx` are runtime dependencies) so
 # the SAME image also runs `prisma migrate deploy` and `db:seed` — but the build-only
-# toolchain is pruned from the final layer. Native modules (@node-rs/argon2) are
-# compiled inside the linux container — host node_modules are never copied in
-# (wrong architecture).
+# toolchain is pruned from the final layer. Dependencies are installed INSIDE the linux
+# container — host node_modules are never copied in (wrong architecture). Note
+# @node-rs/argon2 ships prebuilt binaries; this image has no build toolchain, so if a
+# prebuild is ever missing for the target platform `npm ci` fails rather than falling
+# back to compiling.
 
 # --- deps: install with schema present so postinstall `prisma generate` works ---
-FROM node:20-slim AS deps
+FROM node:22-slim AS deps
 WORKDIR /app
 COPY package.json package-lock.json prisma.config.ts ./
 COPY prisma ./prisma
 RUN npm ci
 
 # --- build: generate client + build Next ---
-FROM node:20-slim AS build
+FROM node:22-slim AS build
 WORKDIR /app
 ENV NEXT_TELEMETRY_DISABLED=1
 COPY --from=deps /app/node_modules ./node_modules
@@ -27,7 +29,7 @@ RUN DATABASE_URL="postgresql://placeholder:placeholder@localhost:5432/placeholde
     npm run build
 
 # --- runner ---
-FROM node:20-slim AS runner
+FROM node:22-slim AS runner
 WORKDIR /app
 ENV NODE_ENV=production
 ENV NEXT_TELEMETRY_DISABLED=1

@@ -13,6 +13,9 @@ const securityHeaders = [
 ];
 
 const nextConfig: NextConfig = {
+  // Don't advertise the framework. Version disclosure is what makes an advisory
+  // like GHSA-6gpp-xcg3-4w24 (the Next 16.2.9 proxy bypass) targetable.
+  poweredByHeader: false,
   async headers() {
     return [{ source: "/:path*", headers: securityHeaders }];
   },
