@@ -10,8 +10,47 @@ on:
     branches: [main]
 
 jobs:
+  # The application source is not in this repo yet (root-level configs and docs only).
+  # Without `prisma/schema.prisma`, `npm ci` dies in postinstall on `prisma generate`
+  # and every step below it is unreachable — so the run fails and emails on every
+  # commit, reporting a problem nobody can act on from here.
+  #
+  # This gate makes `verify` SKIP (not fail) while the source is absent, and start
+  # running by itself the moment the source is pushed. Deliberately not `if: false`
+  # or a deleted workflow: those stay off long after they should have come back on.
+  detect:
+    runs-on: ubuntu-latest
+    outputs:
+      has_source: ${{ steps.check.outputs.has_source }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check whether the application source is present
+        id: check
+        run: |
+          # prisma/schema.prisma is the precise sentinel: it is the exact file whose
+          # absence breaks `npm ci`, so gating on it can't drift from the real cause.
+          if [ -f prisma/schema.prisma ]; then
+            echo "has_source=true" >> "$GITHUB_OUTPUT"
+            echo "Source present — running full verification." >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "has_source=false" >> "$GITHUB_OUTPUT"
+            {
+              echo "### Verification skipped — application source not in the repo"
+              echo
+              echo 'No `prisma/schema.prisma`, so `npm ci` cannot complete its'
+              echo '`postinstall` (`prisma generate`) and no later step can run.'
+              echo
+              echo 'This is not a CI defect. Push the application source'
+              echo '(`app/`, `lib/`, `components/`, `prisma/`, `tests/`, `public/`)'
+              echo 'and this job runs in full automatically — no re-enabling needed.'
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
+
   verify:
     runs-on: ubuntu-latest
+    needs: detect
+    if: needs.detect.outputs.has_source == 'true'
 
     services:
       # The tenant-isolation tests are DB-backed (WAYLINE_SECURITY.md §4), so the
