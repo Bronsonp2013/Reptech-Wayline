@@ -7,4 +7,5 @@ generated
 package-lock.json
 # Leave the spec docs and prototype formatting untouched
 WAYLINE_*.md
+PUSH_SOURCE.md
 WAYLINE_UI_REFERENCE.jsx.txt

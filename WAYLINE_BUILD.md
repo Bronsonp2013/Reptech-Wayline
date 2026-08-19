@@ -50,11 +50,13 @@ ready (drives in, Docker enabled).
    (`openssl rand -hex 32`, plus new DB and seed passwords. If that seed password
    is reused anywhere personally, change it there first.)
 2. **Make the repo private.** Decided, not yet done.
-3. **Push the source via git CLI**, never the web uploader. ⚠️ The local tree and
-   `main` have diverged — `main` carries six commits touching `README.md`,
+3. **Push the source via git CLI**, never the web uploader. ⚠️ The local tree
+   and `main` have diverged — `main` carries six commits touching `README.md`,
    `Dockerfile`, `package.json`, `next.config.ts`, `proxy.ts` and both compose
    files. `git pull origin main` first (take main's side on config/doc
    conflicts), then commit and push.
+   📄 **Exact commands: [`PUSH_SOURCE.md`](PUSH_SOURCE.md)**, with
+   `scripts/preflight-push.sh` as the guard that blocks a repeat of `fed1619`.
 4. **Supply `WAYLINE_MASTER_PLAN.md`** — the superseded banners reference it, so
    that pointer currently dangles.
 
