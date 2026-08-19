@@ -49,15 +49,17 @@ ready (drives in, Docker enabled).
    Untracking did not un-leak it — rotation is the only thing that ends it.
    (`openssl rand -hex 32`, plus new DB and seed passwords. If that seed password
    is reused anywhere personally, change it there first.)
-2. **Make the repo private.** Decided, not yet done.
-3. **Push the source via git CLI**, never the web uploader. ⚠️ The local tree
+   **The repo stays public by decision (2026-08-19), so the blob stays publicly
+   readable indefinitely — rotation is the only mitigation left.** Do not re-raise
+   visibility as a blocker; it was considered and settled.
+2. **Push the source via git CLI**, never the web uploader. ⚠️ The local tree
    and `main` have diverged — `main` carries six commits touching `README.md`,
    `Dockerfile`, `package.json`, `next.config.ts`, `proxy.ts` and both compose
    files. `git pull origin main` first (take main's side on config/doc
    conflicts), then commit and push.
    📄 **Exact commands: [`PUSH_SOURCE.md`](PUSH_SOURCE.md)**, with
    `scripts/preflight-push.sh` as the guard that blocks a repeat of `fed1619`.
-4. **Supply `WAYLINE_MASTER_PLAN.md`** — the superseded banners reference it, so
+3. **Supply `WAYLINE_MASTER_PLAN.md`** — the superseded banners reference it, so
    that pointer currently dangles.
 
 **Then, in order:**

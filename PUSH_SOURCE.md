@@ -14,16 +14,11 @@ the two.
 
 ---
 
-## Step 0 — Two things on github.com, before anything else
+## Step 0 — Rotate the three leaked secrets
 
-These are independent of the push, but the leak is live right now.
-
-**0a. Make the repo private.**
-Settings → General → scroll to Danger Zone → *Change visibility* → Private.
-
-**0b. Rotate the three leaked secrets.** Commit `fed1619` published a real
-`.env` to a public repo. The file is untracked now, but the blob is still
-readable in history — I confirmed it today. Untracking did not un-leak it.
+Independent of the push, but the leak is live right now. Commit `fed1619`
+published a real `.env`. The file is untracked today, but the blob is still
+readable in `main`'s history — verified 2026-08-19. Untracking did not un-leak it.
 
 ```bash
 openssl rand -hex 32        # new SESSION_SECRET
@@ -33,8 +28,10 @@ Then set a new Postgres password and a new seed login in your local `.env`.
 **If that seed password is reused anywhere personal, change it there first** —
 that matters more than this repo does.
 
-Going private does not un-leak it either; anyone who cloned it still has it.
-Rotation is the only thing that ends the exposure.
+**The repo stays public by decision.** That is settled and not up for
+re-litigation; it does mean the old values stay publicly readable indefinitely,
+so rotating them is the only mitigation available. Once rotated, the exposed
+blob is inert.
 
 ---
 
