@@ -14,7 +14,9 @@
 > 1. Put this file at the root of an empty project folder (e.g. `~/wayline/WAYLINE_BUILD.md`).
 > 2. Open Claude Code in that folder.
 > 3. Start each session by saying: *"Read WAYLINE_BUILD.md. We're doing Session N. Follow the steps for that session only. Ask me before making structural decisions not covered by the spec."*
-> 4. At the end of each session, have Claude Code update the **BUILD LOG** at the bottom.
+> 4. At the end of each session, have Claude Code update **§0 START HERE** (current
+>    status and what's next) and the **BUILD LOG** at the bottom. §0 is what the next
+>    session reads first; the BUILD LOG is the detailed record.
 > 5. **Commit and push at the end of every session — via the git CLI, never GitHub's web
 >    uploader.** Treat this as part of each session's "done when", not an afterthought.
 >
@@ -25,6 +27,62 @@
 > uploader). Sessions 1–6 of verified work existed only on one local machine, and the one
 > thing that did reach GitHub was the secrets. The git CLI would have prevented both halves
 > of that: `.gitignore` is honored, and `git add -A` takes the whole tree.
+
+---
+
+## 0. START HERE — current status (updated 2026-08-13)
+
+> This section is the resume point. Update it at the end of every session; the
+> detailed per-session record stays in the **BUILD LOG** at the bottom.
+
+**Everything is gated on one thing: the application source has never been pushed
+to this repo.** `app/`, `lib/`, `components/`, `prisma/`, `tests/`, `public/` are
+all absent — the remote holds only root-level configs and docs. Nothing can be
+built, tested, or deployed from the repo until that changes. The NAS itself is
+ready (drives in, Docker enabled).
+
+**Blocked on Bronson — nothing else starts until these are done:**
+
+1. **Rotate the leaked credentials.** Commit `fed1619` published a real `.env` to
+   a public repo (`SESSION_SECRET`, Postgres password, seed login). It is
+   untracked now, but the blob is still in `main`'s history and still readable.
+   Untracking did not un-leak it — rotation is the only thing that ends it.
+   (`openssl rand -hex 32`, plus new DB and seed passwords. If that seed password
+   is reused anywhere personally, change it there first.)
+2. **Make the repo private.** Decided, not yet done.
+3. **Push the source via git CLI**, never the web uploader. ⚠️ The local tree and
+   `main` have diverged — `main` carries six commits touching `README.md`,
+   `Dockerfile`, `package.json`, `next.config.ts`, `proxy.ts` and both compose
+   files. `git pull origin main` first (take main's side on config/doc
+   conflicts), then commit and push.
+4. **Supply `WAYLINE_MASTER_PLAN.md`** — the superseded banners reference it, so
+   that pointer currently dangles.
+
+**Then, in order:**
+
+- **Phase 1 — prove it builds off the laptop.** CI turns itself on the moment
+  `prisma/schema.prisma` appears. **Expect the first real run to be red**: those
+  steps have never executed anywhere. That is the gate working, not breaking.
+  Fix what it surfaces before moving on.
+- **Phase 2 — cadence patch §2–§7** (`WAYLINE_CADENCE_PATCH.md`; §8 docs are
+  done). Land this **before** the deploy — it is a schema migration plus a data
+  backfill, far cheaper against the dev DB than against Brian's live book.
+- **Phase 3 — deploy.** Follow `DEPLOY.md` as written (backup → build → migrate →
+  start) and work its **Carried risks** checklist. Confirm the
+  `cloudflared:2026.8.0` pin resolves; treat `mem_limit` values as estimates.
+
+**Traps that have already bitten once — see the BUILD LOG for detail:**
+
+- GitHub's web uploader ignores `.gitignore` and does not recurse into folders.
+  It caused both the secret leak and the missing source. Git CLI only.
+- `npm run db:migrate` is `prisma migrate dev` — it offers to **reset the
+  database** on drift. Production is `prisma migrate deploy`, always.
+- Every production compose command needs
+  `-f docker-compose.prod.yml --env-file .env.production`.
+- Re-run `npm audit` at each deploy; a stale "dev-only, accepted" triage hid a
+  Next middleware/proxy bypass for a month.
+- The runner's `npm prune --omit=dev` removing `typescript` is **safe** — the
+  Prisma CLI loads `prisma.config.ts` without it (tested). Do not "fix" it.
 
 ---
 
