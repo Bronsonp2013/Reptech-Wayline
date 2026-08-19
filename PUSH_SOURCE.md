@@ -59,8 +59,11 @@ CI gate, DEPLOY.md hardening). Bring them in first, or the push is rejected.
 ```bash
 git fetch origin
 git checkout main
-git pull origin main
+git pull origin claude/wayline-source-push-35stdz
 ```
+
+(That branch is `main` plus this document and the preflight script, so one pull
+gets you the six commits *and* the tooling below.)
 
 Conflicts should be confined to config and docs — `package.json`,
 `package-lock.json`, `Dockerfile`, `next.config.ts`, `proxy.ts`, `README.md`,
@@ -90,6 +93,7 @@ Clone the repo beside it, then copy the source in.
 cd ~                                  # or wherever you keep projects
 git clone https://github.com/Bronsonp2013/Reptech-Wayline.git wayline-push
 cd wayline-push
+git pull origin claude/wayline-source-push-35stdz
 ```
 
 Copy only the source directories from your working folder — **not** config files,
